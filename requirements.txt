@@ -1,0 +1,7 @@
+PyQt6>=6.4.0
+PyQt6-sip>=13.4.0
+python-magic>=0.4.27
+aionotify>=0.2.0
+qasync>=0.23.0
+psutil>=5.9.0
+blake3>=0.3.3 
