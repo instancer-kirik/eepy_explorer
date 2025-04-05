@@ -1686,133 +1686,215 @@ class NotesDuplicateDialog(QDialog):
         """Compare selected notes with their original versions"""
         root = self.results_tree.invisibleRootItem()
         
-        # Collect items to compare, grouped by parent
-        compare_groups = {}
-        content_match_count = 0
-        unknown_match_count = 0
+        # First collect all selected items with their originals
+        originals = {}  # Maps original paths to original items
+        duplicates = {}  # Maps original paths to list of duplicate items
+        identical_duplicates = {}  # Maps original paths to list of identical duplicates
+        different_duplicates = {}  # Maps original paths to list of different duplicates
         
+        # Collect all items and organize them
         for i in range(root.childCount()):
             group = root.child(i)
-            group_key = i
             is_content_group = "content_" in group.text(0) if isinstance(group.text(0), str) else False
             
-            compare_groups[group_key] = {
-                'original': None,
-                'duplicates': [],
-                'is_content_group': is_content_group
-            }
+            original_item = None
+            selected_duplicates = []
             
             # First find the original in this group
             for j in range(group.childCount()):
                 item = group.child(j)
                 if "Original" in item.text(5):
-                    compare_groups[group_key]['original'] = item
+                    original_item = item
                     break
             
             # If no original was found, use the first item
-            if not compare_groups[group_key]['original'] and group.childCount() > 0:
-                compare_groups[group_key]['original'] = group.child(0)
+            if not original_item and group.childCount() > 0:
+                original_item = group.child(0)
+            
+            if not original_item:
+                continue
+                
+            original_path = original_item.text(4)
+            originals[original_path] = original_item
             
             # Now collect selected duplicates
             for j in range(group.childCount()):
                 item = group.child(j)
                 if item.checkState(0) == Qt.CheckState.Checked:
-                    # Don't compare the original into itself
-                    if item != compare_groups[group_key]['original']:
-                        compare_groups[group_key]['duplicates'].append(item)
-                        # Track content match status
+                    # Don't include the original itself
+                    if item != original_item:
+                        selected_duplicates.append(item)
+                        
+                        # Categorize as identical or different
                         if is_content_group or item.text(6) == "YES - 100% IDENTICAL":
-                            content_match_count += 1
+                            if original_path not in identical_duplicates:
+                                identical_duplicates[original_path] = []
+                            identical_duplicates[original_path].append(item)
                         else:
-                            unknown_match_count += 1
+                            if original_path not in different_duplicates:
+                                different_duplicates[original_path] = []
+                            different_duplicates[original_path].append(item)
             
-            # Remove groups with no selected duplicates
-            if not compare_groups[group_key]['duplicates']:
-                del compare_groups[group_key]
+            if selected_duplicates:
+                duplicates[original_path] = selected_duplicates
         
         # Check if anything is selected
-        if not compare_groups:
+        if not duplicates:
             QMessageBox.information(self, "No Selection", "No duplicate notes selected for comparison.")
             return
+            
+        # Count the items
+        identical_count = sum(len(items) for items in identical_duplicates.values())
+        different_count = sum(len(items) for items in different_duplicates.values())
         
-        # Count total items to compare
-        total_duplicates = content_match_count + unknown_match_count
+        # If we have identical duplicates, offer to auto-delete them
+        auto_deleted = 0
+        if identical_count > 0:
+            message = (f"Found {identical_count} duplicates with identical content to their originals.\n\n"
+                      f"Would you like to automatically delete these identical duplicates?")
+            
+            response = QMessageBox.question(
+                self,
+                "Identical Duplicates Found",
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if response == QMessageBox.StandardButton.Yes:
+                # Auto-delete identical duplicates
+                deleted, errors = self.delete_identical_duplicates(identical_duplicates)
+                auto_deleted = deleted
+                
+                if errors:
+                    QMessageBox.warning(
+                        self,
+                        "Deletion Errors",
+                        f"Deleted {deleted} out of {identical_count} identical duplicates with {len(errors)} errors:\n\n" + 
+                        "\n".join(errors[:10])
+                    )
+                else:
+                    QMessageBox.information(
+                        self,
+                        "Deletion Complete",
+                        f"Successfully deleted {deleted} identical duplicates."
+                    )
         
-        # Construct a more informative confirmation message
-        compare_message = f"You've selected {total_duplicates} duplicate files to compare.\n"
-        compare_message += "Each duplicate will be compared with its original one at a time."
-        
-        # Confirm comparison
-        confirm = QMessageBox.question(
-            self, 
-            "Confirm Comparison", 
-            compare_message,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-        
-        # Compare files
-        compared_count = 0
+        # If we have different duplicates, proceed with manual review
+        if different_count > 0:
+            message = (f"Found {different_count} duplicates with differences from their originals.\n\n"
+                      f"Would you like to review these files individually?")
+            
+            response = QMessageBox.question(
+                self,
+                "Different Duplicates Found",
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if response == QMessageBox.StandardButton.Yes:
+                # Compare files with differences individually
+                compared_count = 0
+                errors = []
+                action_taken = None
+                
+                # Flatten the different duplicates for easier iteration
+                to_compare = []
+                for orig_path, dup_items in different_duplicates.items():
+                    orig_item = originals[orig_path]
+                    for dup_item in dup_items:
+                        to_compare.append((orig_item, dup_item))
+                
+                # Compare each pair
+                for orig_item, dup_item in to_compare:
+                    orig_path = orig_item.text(4)
+                    dup_path = dup_item.text(4)
+                    
+                    try:
+                        # Compare files
+                        diff = self.compare_files(orig_path, dup_path)
+                        
+                        # Add items to the diff for actions
+                        diff['original_item'] = orig_item
+                        diff['duplicate_item'] = dup_item
+                        diff['original_path'] = orig_path
+                        diff['duplicate_path'] = dup_path
+                        diff['is_content_group'] = False  # These are different files
+                        
+                        # Show differences (this now includes action buttons)
+                        action_taken = self.show_differences(diff)
+                        
+                        # Only count as compared if the dialog was shown
+                        if action_taken != "cancel_all":
+                            compared_count += 1
+                        else:
+                            # User wants to stop comparing
+                            break
+                        
+                    except Exception as e:
+                        errors.append(f"Error comparing {os.path.basename(dup_path)}: {str(e)}")
+                
+                # Show results
+                if errors:
+                    QMessageBox.warning(
+                        self, 
+                        "Comparison Errors", 
+                        f"Compared {compared_count} files with {len(errors)} errors:\n\n" + "\n".join(errors[:10])
+                    )
+                elif compared_count > 0:
+                    QMessageBox.information(
+                        self, 
+                        "Comparison Complete", 
+                        f"Successfully compared {compared_count} duplicate notes to their originals."
+                    )
+                
+                # Update status
+                if auto_deleted > 0:
+                    self.status_label.setText(f"Auto-deleted {auto_deleted} identical duplicates, compared {compared_count} different duplicates")
+                else:
+                    self.status_label.setText(f"Compared {compared_count} duplicate notes")
+        elif auto_deleted > 0:
+            # We deleted identical duplicates and had no different ones
+            self.status_label.setText(f"Auto-deleted {auto_deleted} identical duplicates")
+            QMessageBox.information(
+                self,
+                "Processing Complete",
+                f"Successfully deleted {auto_deleted} identical duplicates. No files with differences were found."
+            )
+        else:
+            # No action was taken
+            QMessageBox.information(
+                self,
+                "No Action Taken",
+                "No files were processed. Please select some duplicates and try again."
+            )
+    
+    def delete_identical_duplicates(self, identical_duplicates):
+        """Delete all identical duplicates automatically"""
+        deleted_count = 0
         errors = []
         
-        for group_key, group_data in compare_groups.items():
-            original_item = group_data['original']
-            if not original_item:
-                errors.append(f"No original file found for group {group_key}")
-                continue
-            
-            original_path = original_item.text(4)
-            
-            # Compare files
-            for dup_item in group_data['duplicates']:
-                dup_path = dup_item.text(4)
-                
+        # Process each group of identical duplicates
+        for original_path, items in identical_duplicates.items():
+            for item in items:
                 try:
-                    # Compare files
-                    diff = self.compare_files(original_path, dup_path)
-                    
-                    # Add items to the diff for actions
-                    diff['original_item'] = original_item
-                    diff['duplicate_item'] = dup_item
-                    diff['original_path'] = original_path
-                    diff['duplicate_path'] = dup_path
-                    diff['is_content_group'] = group_data['is_content_group']
-                    
-                    # Show differences (this now includes action buttons)
-                    action_taken = self.show_differences(diff)
-                    
-                    # Only count as compared if the dialog was shown
-                    if action_taken != "cancel_all":
-                        compared_count += 1
-                    else:
-                        # User wants to stop comparing
-                        break
-                    
+                    file_path = item.text(4)  # Path is in column 4
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        deleted_count += 1
+                        
+                        # Remove the item from the tree
+                        parent = item.parent()
+                        parent.removeChild(item)
+                        
+                        # If group is now empty, remove it
+                        if parent.childCount() <= 1:  # Only original left
+                            idx = self.results_tree.indexOfTopLevelItem(parent)
+                            if idx >= 0:
+                                self.results_tree.takeTopLevelItem(idx)
                 except Exception as e:
-                    errors.append(f"Error comparing {os.path.basename(dup_path)}: {str(e)}")
-            
-            # If user canceled all, stop the entire process
-            if action_taken == "cancel_all":
-                break
+                    errors.append(f"Error deleting {os.path.basename(file_path)}: {str(e)}")
         
-        # Show results
-        if errors:
-            QMessageBox.warning(
-                self, 
-                "Comparison Errors", 
-                f"Compared {compared_count} files with {len(errors)} errors:\n\n" + "\n".join(errors[:10])
-            )
-        elif compared_count > 0:
-            QMessageBox.information(
-                self, 
-                "Comparison Complete", 
-                f"Successfully compared {compared_count} duplicate notes to their originals."
-            )
-        
-        # Update status
-        self.status_label.setText(f"Compared {compared_count} duplicate notes")
+        return deleted_count, errors
 
     def show_differences(self, diff):
         """Show the differences between two files and provide action buttons"""
