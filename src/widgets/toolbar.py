@@ -294,6 +294,14 @@ def create_notes_ops_group(explorer, button_style):
     explorer.search_notes_button.clicked.connect(lambda: explorer.search_notes_content())
     explorer.search_notes_button.setStyleSheet(button_style)
     notes_ops_layout.addWidget(explorer.search_notes_button)
+    
+    # Add create note button
+    explorer.create_note_button = QPushButton("New Note")
+    explorer.create_note_button.setIcon(QIcon.fromTheme("document-new"))
+    explorer.create_note_button.setToolTip("Create a New Note")
+    explorer.create_note_button.clicked.connect(lambda: explorer.create_new_note())
+    explorer.create_note_button.setStyleSheet(button_style)
+    notes_ops_layout.addWidget(explorer.create_note_button)
 
     return notes_ops
 

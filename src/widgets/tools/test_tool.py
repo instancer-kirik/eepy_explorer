@@ -108,13 +108,25 @@ class TestTool(QObject):
     def filter_tests(self, filter_text):
         """Filter displayed test results"""
         if not filter_text:
-            # Show all items
+            # Clear filter
             for i in range(self.explorer.test_view.results_tree.topLevelItemCount()):
                 self.explorer.test_view.results_tree.topLevelItem(i).setHidden(False)
             return
             
-        # Hide non-matching items
+        # Apply filter
         filter_text = filter_text.lower()
+        
         for i in range(self.explorer.test_view.results_tree.topLevelItemCount()):
             item = self.explorer.test_view.results_tree.topLevelItem(i)
-            item.setHidden(not filter_text in item.text(0).lower())
+            item.setHidden(filter_text not in item.text(0).lower())
+
+    def watch_tests(self):
+        """Watch for file changes and run tests automatically"""
+        try:
+            # Start watching tests
+            self.test_watcher = self.explorer.test_runner.watch_tests()
+            self.explorer.status_bar.showMessage("Watching for changes...")
+            return self.test_watcher
+        except Exception as e:
+            self.explorer.show_error(f"Error watching tests: {str(e)}")
+            return None

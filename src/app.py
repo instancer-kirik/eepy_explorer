@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QStyleFactory
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPalette, QColor
 import sys
@@ -31,6 +31,19 @@ def setup_application_style(app: QApplication):
                 app.setPalette(palette)
         except:
             pass
+
+    try:
+        # Apply dark theme if available
+        if hasattr(QStyleFactory, 'keys') and "Fusion" in QStyleFactory.keys():
+            app.setStyle("Fusion")
+            # Set dark palette
+            palette = QPalette()
+            palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
+            palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
+            app.setPalette(palette)
+    except Exception as e:
+        print(f"Could not apply dark theme: {e}")
+        pass
 
 def main():
     app = QApplication(sys.argv)

@@ -16,6 +16,7 @@ class NotesModel(QObject):
         self.root_path = root_path
         self.notes_data = []
         self.tags_map = {}  # Maps tags to file paths
+        self.filter_tag = None  # Store current tag filter
         
     def load_from_cache(self, cached_data):
         """Load model from cached data"""
@@ -35,6 +36,11 @@ class NotesModel(QObject):
     def get_serializable_data(self):
         """Get data in a format that can be serialized to JSON"""
         return self.notes_data
+
+    def setFilterTag(self, tag):
+        """Set the tag to filter notes by"""
+        self.filter_tag = tag
+        # Emit signal if needed to update views
 
 
 class NotesLoader(QThread):
@@ -863,12 +869,170 @@ class NotesManager(QObject):
             print(f"Error extracting tags from {file_path}: {e}")
             return []
 
+    def show_sort_dialog(self, parent=None):
+        """Open the sort notes dialog"""
+        try:
+            from ..widgets.sort_dialog import SortDialog
+            dialog = SortDialog(parent)
+            dialog.exec()
+        except ImportError as e:
+            print(f"Error importing sort dialog: {e}")
+            if parent:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(parent, "Error", "Sort dialog module not available")
+                
+    def search_notes_content(self, parent=None):
+        """Search across notes content"""
+        try:
+            from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
+            
+            if parent is None:
+                print("Parent widget required for dialog")
+                return
+                
+            # Get search term from user
+            search_term, ok = QInputDialog.getText(
+                parent,
+                "Search Notes",
+                "Enter search term:",
+                QLineEdit.EchoMode.Normal
+            )
+            
+            if not ok or not search_term:
+                return
+                
+            # Get the notes vault path
+            notes_path = self.get_notes_vault_path()
+            if not notes_path:
+                QMessageBox.warning(parent, "Error", "Notes vault path not available")
+                return
+                
+            # TODO: Implement proper search UI
+            # For now, just use a simple message
+            QMessageBox.information(parent, "Search", f"Searching for: {search_term}")
+            
+            # Open a simple search results dialog in the future
+            
+        except Exception as e:
+            print(f"Error searching notes: {e}")
+            if parent:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(parent, "Error", f"Error searching notes: {str(e)}")
+    
+    def manage_tags(self, parent=None):
+        """Manage notes tags"""
+        try:
+            # TODO: Implement tag management UI
+            if parent:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(parent, "Tags", "Tag management will be implemented in a future update")
+        except Exception as e:
+            print(f"Error in tag management: {e}")
+            if parent:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(parent, "Error", f"Error in tag management: {str(e)}")
+                
+    def create_new_note(self, parent=None):
+        """Create a new note in the notes vault"""
+        try:
+            from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
+            import os
+            from datetime import datetime
+            
+            if parent is None:
+                print("Parent widget required for dialog")
+                return
+                
+            # Get the notes vault path
+            notes_path = self.get_notes_vault_path()
+            if not notes_path:
+                QMessageBox.warning(parent, "Error", "Notes vault path not available")
+                return
+                
+            # Get note title from user
+            title, ok = QInputDialog.getText(
+                parent,
+                "Create New Note",
+                "Enter note title:",
+                QLineEdit.EchoMode.Normal
+            )
+            
+            if not ok or not title:
+                return
+                
+            # Sanitize title for filename
+            filename = title.replace('/', '-').replace('\\', '-')
+            if not filename.endswith('.md'):
+                filename += '.md'
+                
+            filepath = os.path.join(notes_path, filename)
+            
+            # Check if file already exists
+            if os.path.exists(filepath):
+                if QMessageBox.question(
+                    parent, 
+                    "File Exists",
+                    f"A note with title '{title}' already exists. Overwrite?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+            
+            # Create note with default template
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(f"""---
+title: {title}
+created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+tags: []
+---
+
+# {title}
+
+"""
+                )
+                
+            QMessageBox.information(parent, "Note Created", f"Created note: {title}")
+            
+            # Refresh notes view
+            self.refresh_notes(parent, force=True)
+            
+            # Open the new note for editing if explorer has that capability
+            if hasattr(parent, 'open_in_internal_editor'):
+                parent.open_in_internal_editor(filepath)
+            
+        except Exception as e:
+            print(f"Error creating note: {e}")
+            if parent:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(parent, "Error", f"Error creating note: {str(e)}")
+                
+    def find_duplicate_notes(self, parent=None):
+        """Find and manage duplicate notes"""
+        try:
+            # Use the more feature-rich notes duplicate dialog
+            from ..widgets.notes_duplicate_dialog import NotesDuplicateDialog
+            
+            dialog = NotesDuplicateDialog(parent)
+            notes_path = self.get_notes_vault_path()
+            if notes_path:
+                dialog.scan_directory(notes_path)
+                dialog.exec()
+            else:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(parent, "Error", "No notes vault path configured.")
+                
+        except Exception as e:
+            print(f"Error finding duplicate notes: {e}")
+            if parent:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(parent, "Error", f"Error finding duplicate notes: {str(e)}")
+
 class NotesTreeModel(QAbstractItemModel):
     """Model for displaying notes in a tree structure"""
     
     def __init__(self, notes_model, parent=None):
         super().__init__(parent)
         self.notes_model = notes_model
+        self.filter_tag = None  # Store the current tag filter
         self._build_tree()
         
     def _build_tree(self):
@@ -978,6 +1142,20 @@ class NotesTreeModel(QAbstractItemModel):
             
         item = node.data
         
+        # Handle visibility based on tag filter
+        if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.ToolTipRole:
+            # If we have a tag filter and this is a file, check if it should be shown
+            if self.filter_tag and self.filter_tag != "all" and not item.get('is_dir', False):
+                # If the item doesn't have the tag, return None to hide it
+                if 'tags' not in item or self.filter_tag not in item['tags']:
+                    if role == Qt.ItemDataRole.DisplayRole:
+                        # Still return data for column 0 so we can expand/collapse folders
+                        if index.column() == 0:
+                            pass  # Continue to return data
+                        else:
+                            # For other columns, hide the data
+                            return None
+        
         if role == Qt.ItemDataRole.DisplayRole:
             column = index.column()
             
@@ -1022,6 +1200,19 @@ class NotesTreeModel(QAbstractItemModel):
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
             
+        node = index.internalPointer()
+        if not node or not node.data:
+            return Qt.ItemFlag.NoItemFlags
+            
+        item = node.data
+        
+        # Check if the item should be enabled based on tag filter
+        if self.filter_tag and self.filter_tag != "all" and not item.get('is_dir', False):
+            if 'tags' not in item or self.filter_tag not in item['tags']:
+                # Keep directories enabled but disable files that don't match the filter
+                if not item.get('is_dir', False):
+                    return Qt.ItemFlag.ItemIsEnabled
+        
         return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
         
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
@@ -1068,6 +1259,23 @@ class NotesTreeModel(QAbstractItemModel):
         print(f"Item not found for path: {path}")
         return QModelIndex()
 
+    def get_index_for_path(self, path):
+        """Get the model index for a given path, with more robust path handling
+        
+        This method is designed to find the index for a path, even if the exact path
+        isn't in the node lookup (for example, if the path uses different path separators
+        or has trailing slashes).
+        """
+        print(f"DEBUG: Looking for index for path: {path}")
+        
+        # Always return an invalid index for root path in notes mode
+        # This ensures the tree shows the top level of the vault
+        return QModelIndex()
+
+    def setFilterTag(self, tag):
+        """Set the tag to filter notes by"""
+        self.filter_tag = tag
+        self.layoutChanged.emit()  # Notify views that the data has changed
 
 class TreeNode:
     """Node in the notes tree model"""

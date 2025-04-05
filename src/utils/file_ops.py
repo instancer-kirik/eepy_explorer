@@ -2,6 +2,7 @@ import os
 import shutil
 from pathlib import Path
 from datetime import datetime
+import zipfile
 from PyQt6.QtWidgets import (QMessageBox, QProgressDialog, QDialog, QDialogButtonBox,
                            QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QGroupBox,
                            QFileDialog)

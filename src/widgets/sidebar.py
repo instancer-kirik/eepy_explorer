@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
-                           QGroupBox, QPushButton, QMenu, QMessageBox)
+                           QGroupBox, QPushButton, QMenu, QMessageBox, QHBoxLayout)
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QIcon
 import os

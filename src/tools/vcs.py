@@ -1,6 +1,6 @@
 import os
 import subprocess
-from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtWidgets import QMessageBox, QInputDialog
 
 class VCSManager:
     def __init__(self, explorer):

@@ -1004,11 +1004,10 @@ def preview_archive(explorer, file_path):
             with zipfile.ZipFile(file_path) as zf:
                 # Get archive index if available
                 try:
-                    index_data = None
-                    if "index.json" in zf.namelist():
-                        with zf.open("index.json") as f:
-                            index_data = json.load(f)
-                except:
+                    with zf.open("index.json") as f:
+                        index_data = json.load(f)
+                except Exception as e:
+                    print(f"Error reading archive index: {str(e)}")
                     index_data = None
                 
                 # Populate views
@@ -1114,7 +1113,8 @@ def create_archive_item_preview(explorer, info, index_data=None):
                 pixmap = QPixmap()
                 pixmap.loadFromData(item_data["preview"])
                 icon_label.setPixmap(pixmap.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio))
-            except:
+            except Exception as e:
+                print(f"Error loading preview image: {str(e)}")
                 pass
     
     # Fallback to default icon

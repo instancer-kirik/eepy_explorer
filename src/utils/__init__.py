@@ -1,3 +1,1 @@
-"""
-Utilities package for EEPY Explorer
-""" 
+"""Utilities package for EEPY Explorer"""
