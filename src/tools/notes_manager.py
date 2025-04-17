@@ -1266,10 +1266,25 @@ class NotesTreeModel(QAbstractItemModel):
         isn't in the node lookup (for example, if the path uses different path separators
         or has trailing slashes).
         """
-        print(f"DEBUG: Looking for index for path: {path}")
-        
-        # Always return an invalid index for root path in notes mode
-        # This ensures the tree shows the top level of the vault
+        # If it's a root path request, return invalid index to show all top-level items
+        if not path or path == "/" or path == self.notes_model.root_path:
+            return QModelIndex()
+            
+        # Normalize path to match what's in the lookup
+        normalized_path = path
+        if path.startswith(self.notes_model.root_path):
+            # Convert absolute path to relative
+            normalized_path = os.path.relpath(path, self.notes_model.root_path)
+            
+        # Try the normalized path
+        if normalized_path in self.node_lookup:
+            node = self.node_lookup[normalized_path]
+            if node.parent:
+                row = node.parent.children.index(node)
+                return self.createIndex(row, 0, node)
+                
+        # If all else fails, return index to show top level
+        print(f"Could not find index for path: {path}, showing root level")
         return QModelIndex()
 
     def setFilterTag(self, tag):

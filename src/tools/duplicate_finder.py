@@ -480,6 +480,10 @@ class DuplicateFinderWorker(QObject):
             empty_files = []
             frontmatter_only_files = []
             
+            # Also check for files with known duplicate suffixes
+            suffix_patterns = get_common_suffix_patterns()
+            suffix_groups = defaultdict(list)
+            
             for i, file_path in enumerate(self.files):
                 # Check if we should stop
                 if self.should_stop:
@@ -487,15 +491,37 @@ class DuplicateFinderWorker(QObject):
                     return
                     
                 try:
-                    # Check file size first
+                    # First check for suffix patterns
+                    filename = os.path.basename(file_path)
+                    base_name = os.path.splitext(filename)[0]
+                    
+                    # Check for common suffix patterns
+                    has_pattern = False
+                    for suffix in suffix_patterns:
+                        if suffix in base_name:
+                            # Get the base name by removing the suffix
+                            pos = base_name.rfind(suffix)
+                            if pos > 0:
+                                # Use the part before the suffix as the group key
+                                base_key = base_name[:pos]
+                                suffix_groups[base_key].append((file_path, suffix))
+                                has_pattern = True
+                                break
+                    
+                    # If this has a suffix pattern, skip the content check
+                    if has_pattern:
+                        continue
+                    
+                    # Check file size
                     file_size = os.path.getsize(file_path)
                     if file_size == 0:
                         file_info = {
                             'path': file_path,
-                            'filename': os.path.basename(file_path),
+                            'filename': filename,
                             'size': 0,
                             'modified': os.path.getmtime(file_path),
-                            'is_empty': True
+                            'is_empty': True,
+                            'is_original': True
                         }
                         empty_files.append(file_info)
                         continue
@@ -511,11 +537,12 @@ class DuplicateFinderWorker(QObject):
                     if frontmatter and not content_without_frontmatter.strip():
                         file_info = {
                             'path': file_path,
-                            'filename': os.path.basename(file_path),
+                            'filename': filename,
                             'size': file_size,
                             'modified': os.path.getmtime(file_path),
                             'tags': self._extract_tags_from_frontmatter(frontmatter),
-                            'is_frontmatter_only': True
+                            'is_frontmatter_only': True,
+                            'is_original': True
                         }
                         frontmatter_only_files.append(file_info)
                         continue
@@ -527,23 +554,118 @@ class DuplicateFinderWorker(QObject):
                 if i % 10 == 0:  # Update progress every 10 files
                     self.progress.emit(i + 1, total_files)
             
+            # Handle suffix-based duplicates
+            for base_key, file_info_list in suffix_groups.items():
+                if len(file_info_list) > 1:  # Only if there's at least one duplicate
+                    # Check if there's a file without any suffix
+                    has_original = False
+                    original_path = ""
+                    for file_path, _ in file_info_list:
+                        filename = os.path.basename(file_path)
+                        base_filename = os.path.splitext(filename)[0]
+                        if base_filename == base_key:
+                            has_original = True
+                            original_path = file_path
+                            break
+                    
+                    # Get file info for all files in this group
+                    group_files = []
+                    for file_path, suffix in file_info_list:
+                        try:
+                            file_size = os.path.getsize(file_path)
+                            modified_time = os.path.getmtime(file_path)
+                            filename = os.path.basename(file_path)
+                            
+                            # Get tags if available
+                            tags = []
+                            try:
+                                with open(file_path, 'r', encoding='utf-8') as f:
+                                    content = f.read()
+                                frontmatter, _ = self._extract_frontmatter(content)
+                                if frontmatter:
+                                    tags = self._extract_tags_from_frontmatter(frontmatter)
+                            except Exception:
+                                pass
+                            
+                            # Build file info - mark as original if it has no suffix
+                            is_original = not suffix or (has_original and file_path == original_path)
+                            
+                            file_info = {
+                                'path': file_path,
+                                'filename': filename,
+                                'size': file_size,
+                                'modified': modified_time,
+                                'is_original': is_original,
+                                'suffix_pattern': suffix if suffix else None,
+                                'tags': tags
+                            }
+                            group_files.append(file_info)
+                        except Exception as e:
+                            print(f"Error processing suffix file {file_path}: {e}")
+                    
+                    # If we have a group of files
+                    if group_files:
+                        # If no file was marked as original, mark the oldest one
+                        if not any(f['is_original'] for f in group_files):
+                            group_files.sort(key=lambda x: x['modified'])
+                            group_files[0]['is_original'] = True
+                        
+                        # Add as a suffix group
+                        group_key = f"suffix_{base_key}"
+                        duplicate_groups[group_key] = group_files
+            
             # Process empty files
             if empty_files:
-                # Sort by modification time (newest first)
-                empty_files.sort(key=lambda x: x['modified'], reverse=True)
-                # Mark the newest file as original
-                if empty_files:
-                    empty_files[0]['is_original'] = True
-                duplicate_groups['content_empty_files'] = empty_files
+                # Group by filename to find actual duplicates vs unique files
+                empty_by_name = {}
+                for file_info in empty_files:
+                    filename = file_info['filename']
+                    if filename not in empty_by_name:
+                        empty_by_name[filename] = []
+                    empty_by_name[filename].append(file_info)
+                
+                # Add groups for duplicate empty files
+                for filename, files in empty_by_name.items():
+                    if len(files) > 1:
+                        # Sort by modification time (newest first)
+                        files.sort(key=lambda x: x['modified'], reverse=True)
+                        # Mark the newest file as original
+                        files[0]['is_original'] = True
+                        for i in range(1, len(files)):
+                            files[i]['is_original'] = False
+                        duplicate_groups[f'empty_{filename}'] = files
+                    else:
+                        # Single empty file, add to a special group
+                        if 'empty_files_unique' not in duplicate_groups:
+                            duplicate_groups['empty_files_unique'] = []
+                        duplicate_groups['empty_files_unique'].extend(files)
             
             # Process frontmatter-only files
             if frontmatter_only_files:
-                # Sort by modification time (newest first)
-                frontmatter_only_files.sort(key=lambda x: x['modified'], reverse=True)
-                # Mark the newest file as original
-                if frontmatter_only_files:
-                    frontmatter_only_files[0]['is_original'] = True
-                duplicate_groups['content_frontmatter_only'] = frontmatter_only_files
+                # Group by tags (converted to string for hashability)
+                frontmatter_groups = {}
+                for file_info in frontmatter_only_files:
+                    tags_key = ",".join(sorted(file_info.get('tags', [])))
+                    if tags_key not in frontmatter_groups:
+                        frontmatter_groups[tags_key] = []
+                    frontmatter_groups[tags_key].append(file_info)
+                
+                # Add groups
+                for tags_key, files in frontmatter_groups.items():
+                    if len(files) > 1:
+                        # Sort by modification time (newest first)
+                        files.sort(key=lambda x: x['modified'], reverse=True)
+                        # Mark the newest file as original
+                        files[0]['is_original'] = True
+                        for i in range(1, len(files)):
+                            files[i]['is_original'] = False
+                        group_id = f"frontmatter_{hash(tags_key)}"
+                        duplicate_groups[group_id] = files
+                    else:
+                        # Single frontmatter file
+                        if 'frontmatter_unique' not in duplicate_groups:
+                            duplicate_groups['frontmatter_unique'] = []
+                        duplicate_groups['frontmatter_unique'].extend(files)
             
             # Continue with normal content hashing for remaining files
             file_hashes = {}
@@ -555,11 +677,37 @@ class DuplicateFinderWorker(QObject):
                     return
                     
                 # Skip files we've already categorized
-                if any(file_path == f['path'] for f in empty_files + frontmatter_only_files):
+                skip_file = False
+                
+                # Check if this file is already in a suffix group
+                for group in duplicate_groups.values():
+                    if any(item.get('path') == file_path for item in group):
+                        skip_file = True
+                        break
+                
+                # Check if this is an empty or frontmatter file
+                if file_path in [f['path'] for f in empty_files + frontmatter_only_files]:
+                    skip_file = True
+                
+                if skip_file:
                     continue
                     
                 try:
-                    # Compute the hash of the file
+                    # Get filename and ensure it doesn't have a suffix pattern
+                    filename = os.path.basename(file_path)
+                    base_name = os.path.splitext(filename)[0]
+                    
+                    # Skip files with suffix patterns (should already be handled)
+                    has_suffix = False
+                    for suffix in suffix_patterns:
+                        if suffix in base_name:
+                            has_suffix = True
+                            break
+                    
+                    if has_suffix:
+                        continue
+                    
+                    # Compute the hash of the file content
                     file_hash = self._compute_file_hash(file_path)
                     
                     # Skip files with errors
@@ -584,10 +732,11 @@ class DuplicateFinderWorker(QObject):
                     # Build file info
                     file_info = {
                         'path': file_path,
-                        'filename': os.path.basename(file_path),
+                        'filename': filename,
                         'size': file_size,
                         'modified': modified_time,
-                        'tags': tags
+                        'tags': tags,
+                        'is_original': True  # Initially mark as original
                     }
                     
                     # Add to the appropriate hash group
@@ -605,17 +754,28 @@ class DuplicateFinderWorker(QObject):
             # Create duplicate groups (skip non-duplicates)
             for file_hash, files in file_hashes.items():
                 if len(files) > 1:
-                    # For suspiciously large groups, verify content with additional check
-                    if len(files) > 20:
-                        print(f"Large group detected: {len(files)} files with hash {file_hash}, performing additional verification")
-                        # Consider adding a more thorough verification here
-                        pass
-                        
-                    # Sort by modification time (newest first)
+                    # For content-identical files, check if they have completely different names
+                    # as these might be false positives
+                    
+                    # Get base names (without extensions)
+                    base_names = [os.path.splitext(f['filename'])[0] for f in files]
+                    
+                    # Check if base names are completely different
+                    if self._names_are_completely_different(base_names):
+                        # Check actual content to verify if they're truly duplicates
+                        # This deep check happens only if names are very different
+                        if not self._verify_content_similarity(files):
+                            # Skip this group if they have different content structure
+                            print(f"Skipping false positive group with hash {file_hash[:10]}")
+                            continue
+                    
+                    # Sort by modified time (newest first)
                     files.sort(key=lambda x: x['modified'], reverse=True)
                     
-                    # Mark the first file as the original
+                    # Mark the newest file as the original
                     files[0]['is_original'] = True
+                    for i in range(1, len(files)):
+                        files[i]['is_original'] = False
                     
                     # Store in duplicate groups
                     group_id = f"content_{file_hash[:10]}"  # Use first 10 chars of hash as ID
@@ -628,8 +788,72 @@ class DuplicateFinderWorker(QObject):
         except Exception as e:
             error_msg = f"Error finding duplicates: {str(e)}"
             print(error_msg)
+            import traceback
+            traceback.print_exc()
             self.error.emit(error_msg)
             self.finished.emit({})  # Empty result
+
+    def _names_are_completely_different(self, names):
+        """Check if a list of names are completely different from each other"""
+        if not names or len(names) <= 1:
+            return False
+            
+        # Check if the names share any common words
+        word_sets = []
+        for name in names:
+            # Split name into words
+            words = re.findall(r'\w+', name.lower())
+            word_sets.append(set(words))
+        
+        # Check for overlap - if no words are shared, names are completely different
+        common_words = set.intersection(*word_sets) if word_sets else set()
+        return len(common_words) == 0
+
+    def _verify_content_similarity(self, files):
+        """Do a deeper check to verify that files are actually duplicates"""
+        if len(files) <= 1:
+            return True
+            
+        # Get paths
+        paths = [f['path'] for f in files]
+        
+        try:
+            # Read first file
+            with open(paths[0], 'r', encoding='utf-8') as f:
+                content1 = f.read()
+                
+            # Check frontmatter structure
+            has_frontmatter = content1.startswith('---')
+            
+            if has_frontmatter:
+                # Extract frontmatter structures for comparison
+                frontmatter_keys = []
+                
+                for path in paths:
+                    try:
+                        with open(path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        if content.startswith('---'):
+                            end_marker = content.find('\n---\n', 4)
+                            if end_marker != -1:
+                                frontmatter = content[4:end_marker]
+                                # Get just the keys in the frontmatter
+                                keys = [line.split(':')[0].strip() for line in frontmatter.split('\n') 
+                                      if ':' in line and not line.strip().startswith('-')]
+                                frontmatter_keys.append(set(keys))
+                    except:
+                        pass
+                
+                # If frontmatter structure is completely different, they're probably not duplicates
+                if frontmatter_keys and len(set.intersection(*frontmatter_keys)) == 0:
+                    return False
+            
+            # Additional checks could be added here
+            return True
+            
+        except Exception as e:
+            print(f"Error verifying content similarity: {e}")
+            return True  # Default to keeping the group if verification fails
 
     def _compute_file_hash(self, file_path):
         """Compute a blake2b hash of a file"""
@@ -723,7 +947,9 @@ class SuffixDuplicateFinderWorker(QObject):
         """Find notes with specific suffixes that indicate duplicates"""
         # Common suffix patterns that indicate duplicates
         suffix_patterns = [
-            "-surfacepro6", 
+            "-surfacepro6",
+            "-DESKTOP-AKQD6B9",
+            "-laptop",
             "-copy",
             " copy",
             " (copy)",
@@ -809,7 +1035,7 @@ class SuffixDuplicateFinderWorker(QObject):
         return duplicates
     
     def analyze_suffix_duplicates(self, filepaths, suffix_patterns):
-        """Analyze suffix-based duplicates"""
+        """Analyze duplicate files identified by suffix patterns"""
         results = []
         
         # First pass - identify which files have suffixes
@@ -841,24 +1067,11 @@ class SuffixDuplicateFinderWorker(QObject):
         all_have_suffixes = all(result['suffix_pattern'] is not None for result in results)
         
         if all_have_suffixes and len(results) > 0:
-            # For the case where all files have suffixes, mark the base filename as original
-            # Find the shortest filename (likely the base name)
-            results.sort(key=lambda x: len(x['filename']))
-            # Mark the first (shortest) as original
-            results[0]['is_original'] = True
-        
-        # Ensure we've identified at least one original file
-        has_original = any(result['is_original'] for result in results)
-        
-        if not has_original and len(results) > 0:
-            # If no file was marked as original, mark the oldest file as original
+            # If all files have suffixes, mark the oldest one as original
             results.sort(key=lambda x: x['modified'])
             results[0]['is_original'] = True
             results[0]['suffix_pattern'] = None  # Clear the suffix pattern for the designated original
-        
-        # Sort by status (original first) then by modified time (newest first)
-        results.sort(key=lambda x: (not x['is_original'], -x['modified']))
-        
+            
         return results
         
     def extract_tags(self, filepath):

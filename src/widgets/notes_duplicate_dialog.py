@@ -1,9 +1,9 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                            QTreeWidget, QTreeWidgetItem, QLabel, QProgressBar,
                            QCheckBox, QMessageBox, QHeaderView, QComboBox, QGroupBox,
-                           QSplitter, QWidget, QPlainTextEdit, QMenu, QLineEdit, QAbstractItemView, QSpacerItem, QSizePolicy, QFileDialog, QTabWidget)
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QObject
-from PyQt6.QtGui import QIcon, QColor, QBrush
+                           QSplitter, QWidget, QPlainTextEdit, QMenu, QLineEdit, QAbstractItemView, QSpacerItem, QSizePolicy, QFileDialog, QTabWidget, QTextEdit)
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QObject, QTimer
+from PyQt6.QtGui import QIcon, QColor, QBrush, QFont
 import os
 import re
 import json
@@ -411,6 +411,10 @@ class NotesDuplicateDialog(QDialog):
         elif parent and hasattr(parent, 'get_notes_dir'):
             self.notes_vault_path = parent.get_notes_dir()
         
+        # Add directory comparison mode flag
+        self.directory_comparison_mode = False
+        self.comparison_directories = []
+        
         # Initialize worker related variables
         self.worker = None
         self.worker_thread = None
@@ -425,6 +429,505 @@ class NotesDuplicateDialog(QDialog):
         # Show the dialog
         self.setWindowTitle("Find and Manage Duplicate Notes")
         self.resize(900, 600)
+        
+    def setup_ui(self):
+        """Initialize the UI components"""
+        # Main layout
+        main_layout = QVBoxLayout(self)
+        
+        # Search options group
+        search_group = QGroupBox("Search Options")
+        search_layout = QVBoxLayout(search_group)
+        
+        # Path input
+        path_layout = QHBoxLayout()
+        path_label = QLabel("Directory to scan:")
+        self.path_edit = QLineEdit()
+        if self.notes_vault_path:
+            self.path_edit.setText(self.notes_vault_path)
+        else:
+            self.path_edit.setText(os.path.expanduser("~/Notes"))
+        path_browse = QPushButton("Browse")
+        path_browse.clicked.connect(self.browse_directory)
+        path_layout.addWidget(path_label)
+        path_layout.addWidget(self.path_edit, 1)
+        path_layout.addWidget(path_browse)
+        search_layout.addLayout(path_layout)
+        
+        # Add second directory option for comparison mode
+        self.multi_dir_checkbox = QCheckBox("Compare two directories")
+        self.multi_dir_checkbox.toggled.connect(self.toggle_directory_comparison_mode)
+        search_layout.addWidget(self.multi_dir_checkbox)
+        
+        # Second directory selection (hidden by default)
+        self.second_dir_layout = QHBoxLayout()
+        second_dir_label = QLabel("Second directory:")
+        self.second_dir_edit = QLineEdit()
+        second_dir_browse = QPushButton("Browse")
+        second_dir_browse.clicked.connect(self.browse_second_directory)
+        self.second_dir_layout.addWidget(second_dir_label)
+        self.second_dir_layout.addWidget(self.second_dir_edit, 1)
+        self.second_dir_layout.addWidget(second_dir_browse)
+        search_layout.addLayout(self.second_dir_layout)
+        self.second_dir_layout.setVisible(False)  # Initially hidden
+        
+        # Add note about cross-directory comparison
+        self.compare_dirs_note = QLabel(
+            "Cross-directory mode will compare all files between the two directories to find duplicates, "
+            "even if they have different names or are in different sub-folders."
+        )
+        self.compare_dirs_note.setWordWrap(True)
+        self.compare_dirs_note.setStyleSheet("font-style: italic; color: #555;")
+        search_layout.addWidget(self.compare_dirs_note)
+        self.compare_dirs_note.setVisible(False)  # Initially hidden
+        
+        # Search criteria (similar layout as before with added explanations)
+        criteria_layout = QHBoxLayout()
+        criteria_label = QLabel("Search for duplicates by:")
+        self.criteria_combo = QComboBox()
+        self.criteria_combo.addItem("Content Hash (exact duplicates)")
+        self.criteria_combo.addItem("Filename Suffix (copy indicators)")
+        self.criteria_combo.addItem("Note Title")
+        self.criteria_combo.addItem("Similar Tags")
+        criteria_layout.addWidget(criteria_label)
+        criteria_layout.addWidget(self.criteria_combo, 1)
+        search_layout.addLayout(criteria_layout)
+        
+        # Criteria explanation labels
+        self.content_explanation = QLabel(
+            "Content hash mode identifies byte-identical files, regardless of name."
+        )
+        self.suffix_explanation = QLabel(
+            "Suffix mode finds files that appear to be copies (e.g., file-copy.md, file-surfacepro6.md)."
+        )
+        self.title_explanation = QLabel(
+            "Title mode groups notes with the same filename but in different locations."
+        )
+        self.tag_explanation = QLabel(
+            "Tag mode finds notes that share similar tags (80% similarity)."
+        )
+        
+        # Style the explanations
+        for label in [self.content_explanation, self.suffix_explanation, 
+                     self.title_explanation, self.tag_explanation]:
+            label.setWordWrap(True)
+            label.setStyleSheet("font-style: italic; color: #555; margin-left: 10px;")
+            search_layout.addWidget(label)
+        
+        # Initially show only the content explanation
+        self.suffix_explanation.hide()
+        self.title_explanation.hide()
+        self.tag_explanation.hide()
+        
+        # Connect the combo box change event to update explanations
+        self.criteria_combo.currentIndexChanged.connect(self.update_search_explanation)
+        
+        # Advanced options checkbox
+        self.advanced_checkbox = QCheckBox("Show advanced options")
+        self.advanced_checkbox.toggled.connect(self.toggle_advanced_options)
+        search_layout.addWidget(self.advanced_checkbox)
+        
+        # Advanced options group (hidden by default)
+        self.advanced_options = QGroupBox("Advanced Options")
+        advanced_layout = QVBoxLayout(self.advanced_options)
+        
+        # Include subdirectories option
+        self.recursive_checkbox = QCheckBox("Include subdirectories")
+        self.recursive_checkbox.setChecked(True)
+        advanced_layout.addWidget(self.recursive_checkbox)
+        
+        # Auto-select identical option
+        self.auto_select_checkbox = QCheckBox("Auto-select duplicates for deletion")
+        self.auto_select_checkbox.setChecked(True)
+        self.auto_select_checkbox.setToolTip("Automatically select files that appear to be duplicates")
+        advanced_layout.addWidget(self.auto_select_checkbox)
+        
+        # Hide identical groups
+        self.hide_identical_checkbox = QCheckBox("Hide 100% identical groups")
+        self.hide_identical_checkbox.setChecked(False)
+        self.hide_identical_checkbox.setToolTip("Hide groups where all files are identical")
+        advanced_layout.addWidget(self.hide_identical_checkbox)
+        
+        # Add advanced options to layout (hidden by default)
+        search_layout.addWidget(self.advanced_options)
+        self.advanced_options.hide()
+        
+        # Search button
+        search_button_layout = QHBoxLayout()
+        self.search_button = QPushButton("Find Duplicates")
+        self.search_button.clicked.connect(self.start_search)
+        search_button_layout.addStretch()
+        search_button_layout.addWidget(self.search_button)
+        search_layout.addLayout(search_button_layout)
+        
+        # Add search options to main layout
+        main_layout.addWidget(search_group)
+        
+        # Results group (initially hidden)
+        self.results_group = QGroupBox("Results")
+        self.results_group.setVisible(False)
+        results_layout = QVBoxLayout(self.results_group)
+        
+        # Results toolbar
+        toolbar_layout = QHBoxLayout()
+        
+        # Action dropdown
+        action_label = QLabel("Action:")
+        self.action_combo = QComboBox()
+        self.action_combo.addItem("Compare Selected")
+        self.action_combo.addItem("Delete Selected")
+        self.action_combo.addItem("Merge Selected")
+        toolbar_layout.addWidget(action_label)
+        toolbar_layout.addWidget(self.action_combo)
+        
+        # Apply button
+        self.apply_button = QPushButton("Apply")
+        self.apply_button.clicked.connect(self.apply_selection)
+        toolbar_layout.addWidget(self.apply_button)
+        
+        # Selection buttons
+        self.select_all_button = QPushButton("Select All")
+        self.select_all_button.clicked.connect(lambda: self.auto_select_duplicates(select_all=True))
+        toolbar_layout.addWidget(self.select_all_button)
+        
+        self.select_duplicates_button = QPushButton("Select Duplicates")
+        self.select_duplicates_button.clicked.connect(self.auto_select_duplicates)
+        toolbar_layout.addWidget(self.select_duplicates_button)
+        
+        self.clear_selection_button = QPushButton("Clear Selection")
+        self.clear_selection_button.clicked.connect(self.clear_selection)
+        toolbar_layout.addWidget(self.clear_selection_button)
+        
+        self.unselect_group_button = QPushButton("Unselect Group")
+        self.unselect_group_button.clicked.connect(self.unselect_current_group)
+        toolbar_layout.addWidget(self.unselect_group_button)
+        
+        results_layout.addLayout(toolbar_layout)
+        
+        # Results tree
+        self.results_tree = QTreeWidget()
+        self.results_tree.setColumnCount(7)
+        self.results_tree.setHeaderLabels(["Filename", "Size", "Tags", "Modified", "Path", "Status", "Content Match"])
+        self.results_tree.setAlternatingRowColors(True)
+        self.results_tree.setSortingEnabled(True)
+        self.results_tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        
+        # Set column widths
+        self.results_tree.setColumnWidth(0, 200)  # Filename
+        self.results_tree.setColumnWidth(1, 80)   # Size
+        self.results_tree.setColumnWidth(2, 150)  # Tags
+        self.results_tree.setColumnWidth(3, 150)  # Modified
+        # Let Path column take remaining space
+        self.results_tree.setColumnWidth(5, 100)  # Status
+        self.results_tree.setColumnWidth(6, 120)  # Content Match
+        
+        # Enable context menu
+        self.results_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.results_tree.customContextMenuRequested.connect(self.show_context_menu)
+        
+        # Enable multi selection
+        self.results_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        
+        results_layout.addWidget(self.results_tree)
+        
+        # Selection count
+        self.selection_layout = QHBoxLayout()
+        self.selection_label = QLabel("0 items selected")
+        self.selection_layout.addWidget(self.selection_label)
+        
+        # Copy paths button
+        self.copy_paths_button = QPushButton("Copy Selected Paths")
+        self.copy_paths_button.clicked.connect(self.copy_selected_paths)
+        self.selection_layout.addWidget(self.copy_paths_button)
+        
+        results_layout.addLayout(self.selection_layout)
+        
+        # Add results to main layout
+        main_layout.addWidget(self.results_group)
+        
+        # Status bar
+        status_layout = QHBoxLayout()
+        self.status_label = QLabel("Ready")
+        status_layout.addWidget(self.status_label, 1)
+        
+        self.progress_label = QLabel("")
+        status_layout.addWidget(self.progress_label)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        status_layout.addWidget(self.progress_bar)
+        
+        main_layout.addLayout(status_layout)
+        
+        # Button bar
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.on_close)
+        button_layout.addWidget(close_button)
+        
+        main_layout.addLayout(button_layout)
+        
+        # Connect the item change signal to update selection count
+        self.results_tree.itemChanged.connect(self.update_selection_count)
+        
+    def toggle_directory_comparison_mode(self, checked):
+        """Toggle visibility of the second directory input"""
+        self.directory_comparison_mode = checked
+        self.second_dir_layout.setVisible(checked)
+        self.compare_dirs_note.setVisible(checked)
+        
+        # Update the UI based on comparison mode
+        if checked:
+            # Force content hash mode in comparison mode
+            self.criteria_combo.setCurrentIndex(0)
+            self.criteria_combo.setEnabled(False)
+            
+            # If second directory is empty, suggest a path
+            if not self.second_dir_edit.text():
+                # Try to guess a secondary notes directory
+                primary_path = self.path_edit.text()
+                if primary_path:
+                    dir_name = os.path.basename(primary_path)
+                    parent_dir = os.path.dirname(primary_path)
+                    
+                    # Check for common patterns
+                    suggestions = [
+                        os.path.join(parent_dir, f"{dir_name}-old"),
+                        os.path.join(parent_dir, f"{dir_name}_backup"),
+                        os.path.join(parent_dir, f"{dir_name}.bak"),
+                        os.path.join(parent_dir, "old_" + dir_name)
+                    ]
+                    
+                    # Use the first suggestion that exists
+                    for suggestion in suggestions:
+                        if os.path.exists(suggestion):
+                            self.second_dir_edit.setText(suggestion)
+                            break
+        else:
+            # Re-enable criteria selection
+            self.criteria_combo.setEnabled(True)
+            
+    def browse_directory(self):
+        """Browse for a directory to scan"""
+        # Get the current directory
+        current_dir = self.path_edit.text()
+        if not current_dir or not os.path.exists(current_dir):
+            current_dir = os.path.expanduser("~")
+            
+        # Open directory dialog
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select Directory to Scan", current_dir,
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks
+        )
+        
+        if directory:
+            self.path_edit.setText(directory)
+            
+    def browse_second_directory(self):
+        """Browse for a second directory to compare"""
+        # Get the current directory
+        current_dir = self.second_dir_edit.text()
+        if not current_dir or not os.path.exists(current_dir):
+            # Use the first directory as starting point
+            current_dir = self.path_edit.text()
+            if not current_dir or not os.path.exists(current_dir):
+                current_dir = os.path.expanduser("~")
+            
+        # Open directory dialog
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select Second Directory", current_dir,
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks
+        )
+        
+        if directory:
+            self.second_dir_edit.setText(directory)
+            
+    def update_search_explanation(self, index):
+        """Update the search explanation based on selected criteria"""
+        # Hide all explanations
+        self.content_explanation.hide()
+        self.suffix_explanation.hide()
+        self.title_explanation.hide()
+        self.tag_explanation.hide()
+        
+        # Show the relevant explanation
+        if index == 0:
+            self.content_explanation.show()
+        elif index == 1:
+            self.suffix_explanation.show()
+        elif index == 2:
+            self.title_explanation.show()
+        elif index == 3:
+            self.tag_explanation.show()
+            
+    def toggle_advanced_options(self, checked):
+        """Toggle visibility of advanced options"""
+        self.advanced_options.setVisible(checked)
+
+    def scan_directory(self, directory):
+        """Scan directory for duplicates"""
+        self.show()  # Make sure dialog is visible
+        self.notes_vault_path = directory
+        self.path_edit.setText(directory)
+        # Start the scan
+        self.start_search()
+        
+    def find_duplicates(self):
+        """Initialize and start the duplicate finder worker"""
+        # Get selected directories
+        directory = self.path_edit.text()
+        second_directory = self.second_dir_edit.text() if self.directory_comparison_mode else None
+        
+        # Verify paths
+        if not directory or not os.path.exists(directory):
+            QMessageBox.warning(self, "Invalid Directory", "The specified directory does not exist.")
+            return
+            
+        if self.directory_comparison_mode and (not second_directory or not os.path.exists(second_directory)):
+            QMessageBox.warning(self, "Invalid Second Directory", "The specified second directory does not exist.")
+            return
+            
+        # Store paths for comparison mode
+        self.comparison_directories = [directory]
+        if second_directory:
+            self.comparison_directories.append(second_directory)
+        
+        # Disable buttons
+        self.enable_all_buttons(False)
+        
+        # Get search mode
+        scan_mode = ""
+        criteria_index = self.criteria_combo.currentIndex()
+        
+        if criteria_index == 0:
+            scan_mode = "content"
+        elif criteria_index == 1:
+            scan_mode = "suffix"
+        elif criteria_index == 2:
+            scan_mode = "title"
+        elif criteria_index == 3:
+            scan_mode = "tags"
+            
+        # Special handling for directory comparison mode
+        if self.directory_comparison_mode:
+            # Create a worker for comparing two directories
+            self.worker = DirectoryComparisonWorker(directory, second_directory)
+        elif scan_mode in ["content", "suffix"]:
+            # Use the more efficient workers for content and suffix-based scans
+            if scan_mode == "content":
+                self.worker = DuplicateFinderWorker(
+                    self.comparison_directories, 
+                    recursive=self.recursive_checkbox.isChecked()
+                )
+            else:  # suffix mode
+                self.worker = SuffixDuplicateFinderWorker(directory)
+        else:
+            # Use the standard scanner for title and tag-based searches
+            self.worker = NotesDuplicateScanner(directory, scan_mode, self)
+            
+        # Connect signals
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.process_duplicates)
+        if hasattr(self.worker, 'error'):
+            self.worker.error.connect(self.on_error)
+        
+        # Start the worker
+        if self.directory_comparison_mode:
+            # Directory comparison has a run method
+            self.worker_thread = QThread()
+            self.worker.moveToThread(self.worker_thread)
+            self.worker_thread.started.connect(self.worker.run)
+            self.worker_thread.start()
+        elif hasattr(self.worker, 'run'):
+            # NotesDuplicateScanner has a run method
+            self.worker.start()
+        elif hasattr(self.worker, 'find_duplicates'):
+            # DuplicateFinderWorker style
+            self.worker_thread = QThread()
+            self.worker.moveToThread(self.worker_thread)
+            self.worker_thread.started.connect(self.worker.find_duplicates)
+            self.worker_thread.start()
+            
+        self.worker_running = True
+        
+    def verify_files_are_duplicates(self, file1_path, file2_path):
+        """Verify if two files are actual duplicates by comparing content"""
+        try:
+            # Check if files exist
+            if not os.path.exists(file1_path) or not os.path.exists(file2_path):
+                return False
+            
+            # Check file sizes (quick check)
+            size1 = os.path.getsize(file1_path)
+            size2 = os.path.getsize(file2_path)
+            
+            # Different sizes = definitely different content
+            if size1 != size2:
+                return False
+            
+            # For empty files, consider them unique
+            if size1 == 0 and size2 == 0:
+                return False
+            
+            # Calculate and compare hashes
+            with open(file1_path, 'rb') as f1, open(file2_path, 'rb') as f2:
+                # Read the files in chunks to handle large files
+                chunk_size = 4096
+                identical = True
+                
+                while True:
+                    chunk1 = f1.read(chunk_size)
+                    chunk2 = f2.read(chunk_size)
+                    
+                    if chunk1 != chunk2:
+                        identical = False
+                        break
+                    
+                    if not chunk1:  # End of file
+                        break
+                
+                return identical
+        
+        except Exception as e:
+            print(f"Error comparing files {os.path.basename(file1_path)} and {os.path.basename(file2_path)}: {e}")
+            return False
+            
+    def content_similarity(self, file1_path, file2_path):
+        """Calculate content similarity between two files"""
+        try:
+            # Read file contents
+            with open(file1_path, 'r', encoding='utf-8', errors='replace') as f1:
+                content1 = f1.read()
+                
+            with open(file2_path, 'r', encoding='utf-8', errors='replace') as f2:
+                content2 = f2.read()
+                
+            # Extract content (excluding YAML frontmatter if present)
+            _, body1 = self.extract_yaml_and_body(content1)
+            _, body2 = self.extract_yaml_and_body(content2)
+            
+            # Calculate line-by-line similarity
+            lines1 = body1.strip().split('\n')
+            lines2 = body2.strip().split('\n')
+            
+            # Quick check for identical content
+            if body1.strip() == body2.strip():
+                return 1.0
+                
+            # Calculate similarity
+            matching_lines = sum(1 for l1, l2 in zip(lines1, lines2) if l1 == l2)
+            total_lines = max(len(lines1), len(lines2))
+            similarity = matching_lines / total_lines if total_lines > 0 else 0
+            
+            return similarity
+            
+        except Exception as e:
+            print(f"Error calculating similarity: {e}")
+            return 0.0
 
     def closeEvent(self, event):
         """Handle close event to properly clean up threads"""
@@ -536,359 +1039,20 @@ class NotesDuplicateDialog(QDialog):
             self.worker = None
             self.worker_running = False
 
-    def setup_ui(self):
-        """Set up the user interface"""
-        self.setWindowTitle("Find Duplicate Notes")
-        self.resize(900, 600)
-        
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(5)
-        
-        # Setup scanning options
-        scan_group = QGroupBox("Scan Options")
-        scan_layout = QVBoxLayout(scan_group)
-        
-        # Path selection
-        path_layout = QHBoxLayout()
-        path_layout.addWidget(QLabel("Folder:"))
-        self.path_edit = QLineEdit()
-        self.path_edit.setReadOnly(True)
-        path_layout.addWidget(self.path_edit, 1)
-        self.browse_button = QPushButton("Browse...")
-        self.browse_button.clicked.connect(self.browse_directory)
-        path_layout.addWidget(self.browse_button)
-        scan_layout.addLayout(path_layout)
-        
-        # Scan buttons
-        buttons_layout = QHBoxLayout()
-        
-        self.hash_button = QPushButton("Find by Content")
-        self.hash_button.clicked.connect(self.find_duplicates)
-        buttons_layout.addWidget(self.hash_button)
-        
-        self.suffix_button = QPushButton("Find by Suffix")
-        self.suffix_button.clicked.connect(self.find_duplicates_by_suffix)
-        buttons_layout.addWidget(self.suffix_button)
-        
-        scan_layout.addLayout(buttons_layout)
-        
-        main_layout.addWidget(scan_group)
-        
-        # Results group
-        self.results_group = QGroupBox("Results")
-        self.results_group.setVisible(False)  # Hidden until we have results
-        results_layout = QVBoxLayout(self.results_group)
-        
-        # Results tree
-        self.results_tree = QTreeWidget()
-        self.results_tree.setHeaderLabels(["Filename", "Size", "Time", "Hash", "Path", "Status"])
-        self.results_tree.setAlternatingRowColors(True)
-        self.results_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.results_tree.setColumnWidth(0, 200)  # Filename
-        self.results_tree.setColumnWidth(1, 80)   # Size
-        self.results_tree.setColumnWidth(2, 120)  # Time
-        self.results_tree.setColumnWidth(3, 80)   # Hash
-        self.results_tree.setColumnWidth(5, 100)  # Status
-        self.results_tree.header().setStretchLastSection(False)
-        self.results_tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)  # Path column stretches
-        results_layout.addWidget(self.results_tree)
-        
-        # Selection controls
-        selection_layout = QHBoxLayout()
-        
-        # Strategy dropdown for auto-selection
-        selection_layout.addWidget(QLabel("Selection Strategy:"))
-        self.select_strategy_combo = QComboBox()
-        self.select_strategy_combo.addItems([
-            "Keep newest", 
-            "Keep oldest", 
-            "Keep shortest path", 
-            "Keep longest path",
-            "Match pattern"
-        ])
-        selection_layout.addWidget(self.select_strategy_combo)
-        
-        # Custom pattern for regex matching
-        selection_layout.addWidget(QLabel("Pattern:"))
-        self.custom_pattern_edit = QLineEdit()
-        self.custom_pattern_edit.setPlaceholderText("Enter regex pattern...")
-        selection_layout.addWidget(self.custom_pattern_edit)
-        
-        # Auto-select button
-        self.select_button = QPushButton("Auto-Select")
-        self.select_button.clicked.connect(self.auto_select_duplicates)
-        selection_layout.addWidget(self.select_button)
-        
-        # Unselect group button
-        self.unselect_group_button = QPushButton("Unselect Group")
-        self.unselect_group_button.clicked.connect(self.unselect_current_group)
-        selection_layout.addWidget(self.unselect_group_button)
-        
-        # Clear selection button
-        self.clear_button = QPushButton("Clear Selection")
-        self.clear_button.clicked.connect(self.clear_selection)
-        selection_layout.addWidget(self.clear_button)
-        
-        results_layout.addLayout(selection_layout)
-        
-        # Action controls
-        action_layout = QHBoxLayout()
-        
-        # Delete and merge buttons
-        self.delete_button = QPushButton("Delete Selected")
-        self.delete_button.clicked.connect(self.delete_selected)
-        action_layout.addWidget(self.delete_button)
-        
-        self.merge_button = QPushButton("Merge Selected")
-        self.merge_button.clicked.connect(self.merge_selected)
-        action_layout.addWidget(self.merge_button)
-        
-        # Compare button
-        self.compare_button = QPushButton("Compare Selected")
-        self.compare_button.clicked.connect(self.compare_selected)
-        action_layout.addWidget(self.compare_button)
-        
-        # Action dropdown
-        action_layout.addWidget(QLabel("Action:"))
-        self.action_combo = QComboBox()
-        self.action_combo.addItems(["Delete", "Open", "Copy Path"])
-        action_layout.addWidget(self.action_combo)
-        
-        # Apply action button
-        apply_button = QPushButton("Apply to Selected")
-        apply_button.clicked.connect(self.apply_selection)
-        action_layout.addWidget(apply_button)
-        
-        # Selection count
-        self.selection_count_label = QLabel("0 items selected")
-        action_layout.addWidget(self.selection_count_label)
-        
-        # Update selection count when items are checked/unchecked
-        self.results_tree.itemChanged.connect(lambda: self.update_selection_count())
-        
-        results_layout.addLayout(action_layout)
-        
-        main_layout.addWidget(self.results_group)
-        
-        # Status and progress
-        status_layout = QHBoxLayout()
-        self.status_label = QLabel("Ready")
-        status_layout.addWidget(self.status_label)
-        self.progress_label = QLabel("")
-        status_layout.addWidget(self.progress_label)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        status_layout.addWidget(self.progress_bar)
-        main_layout.addLayout(status_layout)
-        
-        # Dialog buttons
-        buttons_layout = QHBoxLayout()
-        spacer = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, 
-                             QSizePolicy.Policy.Minimum)
-        buttons_layout.addItem(spacer)
-        
-        self.close_button = QPushButton("Close")
-        self.close_button.clicked.connect(self.on_close)
-        buttons_layout.addWidget(self.close_button)
-        
-        main_layout.addLayout(buttons_layout)
-        
-        # Set the default path to the notes directory
-        if self.explorer:
-            self.path_edit.setText(self.explorer.get_notes_dir())
-            
-        # Set up the worker
-        self.worker = None
-        self.worker_running = False
-
-    def scan_directory(self, directory):
-        """Scan directory for duplicates"""
-        self.show()  # Make sure dialog is visible
-        self.notes_vault_path = directory
-        # Start the scan using hash-based duplicate detection
-        self.find_duplicates()
-        
-    def start_search(self):
-        """Setup for starting a search"""
-        # Update the UI
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("Scanning notes...")
-        self.status_label.setText("Searching for duplicates...")
-        
-        # Configure the results tree
-        self.results_tree.clear()
-        self.results_tree.setColumnCount(7)  # Added a column for content match
-        self.results_tree.setHeaderLabels(["Filename", "Size", "Tags", "Modified", "Path", "Status", "Content Match"])
-        
-        # Show the results section
-        self.results_group.setVisible(True)
-        
-        # Disable the search buttons while searching
-        self.hash_button.setEnabled(False)
-        self.suffix_button.setEnabled(False)
-
-    def find_duplicates(self):
-        """Find duplicate notes using content-based hashing"""
-        # Stop any existing worker
-        self.stop_worker()
-        self.wait_for_threads()
-
-        # Update UI
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        self.progress_label.setText("Searching for duplicate notes by content hash...")
-        self.status_label.setText("Finding duplicates by content...")
-        
-        # Disable buttons during search
-        self.hash_button.setEnabled(False)
-        self.suffix_button.setEnabled(False)
-        self.select_button.setEnabled(False)
-        self.clear_button.setEnabled(False)
-        self.delete_button.setEnabled(False)
-        self.merge_button.setEnabled(False)
-        
-        try:
-            # Get list of files to check
-            notes_dir = self.notes_vault_path
-            
-            # Find all markdown files
-            all_files = []
-            for root, _, files in os.walk(notes_dir):
-                for file in files:
-                    if file.endswith('.md'):
-                        all_files.append(os.path.join(root, file))
-            
-            # Create and set up worker thread
-            self.worker_thread = QThread()
-            self.worker = DuplicateFinderWorker(all_files)
-            self.worker.moveToThread(self.worker_thread)
-            
-            # Connect signals
-            self.worker.started.connect(lambda: self.progress_label.setText("Finding duplicates..."))
-            self.worker.progress.connect(self.update_progress)
-            self.worker.finished.connect(self.process_duplicates)
-            self.worker.error.connect(self.on_error)
-            
-            # Connect thread start to worker
-            self.worker_thread.started.connect(self.worker.find_duplicates)
-            
-            # Start the thread
-            self.worker_thread.start()
-            
-        except Exception as e:
-            self.on_error(f"Failed to start duplicate finder: {str(e)}")
-            self.enable_all_buttons()
-
-    def find_duplicates_by_suffix(self):
-        """Find duplicate notes based on suffix patterns"""
-        directory = self.path_edit.text()
-        if not directory or not os.path.isdir(directory):
-            QMessageBox.warning(self, "Invalid Directory", "Please select a valid directory to scan")
-            return
-            
-        # Update UI
-        self.results_group.setVisible(False)
-        self.status_label.setText("Scanning for suffix duplicates...")
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        
-        # Disable buttons during scan
-        self.enable_all_buttons(False)
-        
-        try:
-            # Stop any existing worker
-            self.stop_worker()
-            
-            # Create a new suffix worker
-            self.worker = SuffixDuplicateFinderWorker(directory)
-            
-            # Connect signals
-            self.worker.progress.connect(self.update_progress)
-            self.worker.finished.connect(self.process_duplicates)
-            self.worker.error.connect(self.on_error)
-            
-            # Start the worker in a new thread
-            self.worker_thread = QThread()
-            self.worker.moveToThread(self.worker_thread)
-            self.worker_thread.started.connect(self.worker.run)
-            
-            # Set worker as running
-            self.worker_running = True
-            
-            # Start the thread
-            self.worker_thread.start()
-            
-        except Exception as e:
-            self.on_error(str(e))
-            self.enable_all_buttons(True)
-
-    def update_progress(self, value, maximum):
-        """Update the progress bar"""
-        if maximum > 0:
-            percentage = (value / maximum) * 100
-            self.progress_bar.setValue(int(percentage))
-            self.progress_label.setText(f"Processing files: {value}/{maximum} ({int(percentage)}%)")
-
-    def process_duplicates(self, duplicates):
-        """Process duplicate results from worker"""
-        # Make results visible regardless of whether duplicates were found
-        self.results_group.setVisible(True)
-        
-        # Log what we received for debugging
-        print(f"Received duplicate results: {len(duplicates)} groups")
-        for key in duplicates.keys():
-            print(f"  Group: {key} with {len(duplicates[key])} files")
-        
-        self.populate_results(duplicates)
-        self.enable_all_buttons()
-        
-        # Total up stats for the status message
-        total_groups = 0
-        total_files = 0
-        for group in duplicates.values():
-            if len(group) > 1:  # Only count actual duplicate groups
-                total_groups += 1
-                total_files += len(group)
-                
-        if total_groups > 0:
-            self.status_label.setText(f"Found {total_groups} duplicate groups with {total_files} files")
-        else:
-            self.status_label.setText("No duplicates found")
-            # Make it clear to the user what happened
-            self.results_tree.clear()
-            no_results_item = QTreeWidgetItem(self.results_tree)
-            no_results_item.setText(0, "No duplicate notes found")
-            no_results_item.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
-        
-        self.progress_label.setText("Done")
-        self.progress_bar.setValue(100)
-
-    def on_error(self, error_msg):
-        """Handle errors from the worker thread"""
-        QMessageBox.critical(self, "Error", error_msg)
-        self.status_label.setText(f"Error: {error_msg}")
-        self.progress_label.setText("Failed")
-        print(f"Error in duplicate finder: {error_msg}")
-        
-        # Ensure buttons are enabled
-        self.enable_all_buttons()
-
     def enable_all_buttons(self, enabled=True):
         """Enable or disable all buttons in the dialog"""
         self.browse_button.setEnabled(enabled)
         
         # If using old-style UI
-        if hasattr(self, 'hash_button'):
-            self.hash_button.setEnabled(enabled)
-            self.suffix_button.setEnabled(enabled)
+        if hasattr(self, 'search_button'):
+            self.search_button.setEnabled(enabled)
             self.select_button.setEnabled(enabled)
             self.clear_button.setEnabled(enabled)
             self.delete_button.setEnabled(enabled)
             self.merge_button.setEnabled(enabled)
             self.compare_button.setEnabled(enabled)
             self.unselect_group_button.setEnabled(enabled)
+            self.copy_paths_button.setEnabled(enabled)
         
         # Apply buttons from new UI
         if hasattr(self, 'action_combo'):
@@ -905,8 +1069,10 @@ class NotesDuplicateDialog(QDialog):
         
         # Populate tree
         for group_id, files in duplicates.items():
-            # Skip groups with only one file
-            if len(files) <= 1:
+            # Skip groups with only one file unless they're special groups
+            is_empty_unique = "empty_files_unique" == group_id
+            is_frontmatter_unique = "frontmatter_unique" in str(group_id)
+            if len(files) <= 1 and not (is_empty_unique or is_frontmatter_unique):
                 continue
             
             # Create group item
@@ -917,11 +1083,14 @@ class NotesDuplicateDialog(QDialog):
                 if base_name:
                     group_name = base_name
                     
+            # Calculate total size for the group
+            total_group_size = sum(f.get('size', 0) for f in files)
+            
             # Customize group item based on group type
-            is_suffix_group = "suffix_" in group_id if isinstance(group_id, str) else False
-            is_content_group = "content_" in group_id if isinstance(group_id, str) else False
-            is_empty_file_group = group_id == "content_empty_fil" if isinstance(group_id, str) else False
-            is_frontmatter_group = "content_frontmat" in group_id if isinstance(group_id, str) else False
+            is_suffix_group = "suffix_" in str(group_id) if isinstance(group_id, str) else False
+            is_content_group = "content_" in str(group_id) if isinstance(group_id, str) else False
+            is_empty_group = "empty_" in str(group_id) and not is_empty_unique if isinstance(group_id, str) else False
+            is_frontmatter_group = "frontmatter_" in str(group_id) and not is_frontmatter_unique if isinstance(group_id, str) else False
             
             # Add warning for suspiciously large groups
             large_group_warning = ""
@@ -930,20 +1099,46 @@ class NotesDuplicateDialog(QDialog):
             
             # Group title
             group_item = QTreeWidgetItem(self.results_tree)
+            group_size_text = self.format_size(total_group_size)
+            
             if is_suffix_group:
                 group_item.setText(0, f"Suffix Group: {group_name} ({len(files)} files){large_group_warning}")
                 group_item.setIcon(0, QIcon.fromTheme("edit-copy"))
-            elif is_empty_file_group:
-                group_item.setText(0, f"Empty Files Group ({len(files)} files){large_group_warning}")
+                group_item.setText(1, group_size_text)  # Show total size for the group
+            elif is_empty_unique:
+                group_item.setText(0, f"Empty Files ({len(files)} files)")
                 group_item.setIcon(0, QIcon.fromTheme("edit-copy"))
+                group_item.setText(1, group_size_text)  # Show total size for the group
+                group_item.setBackground(0, QBrush(QColor(220, 220, 255)))  # Light blue background for unique
+            elif is_empty_group:
+                group_item.setText(0, f"Duplicate Empty Files ({len(files)} files){large_group_warning}")
+                group_item.setIcon(0, QIcon.fromTheme("edit-copy"))
+                group_item.setText(1, group_size_text)  # Show total size for the group
                 group_item.setBackground(0, QBrush(QColor(255, 220, 220)))  # Light red background
-            elif is_frontmatter_group:
-                group_item.setText(0, f"Frontmatter-only Group ({len(files)} files){large_group_warning}")
+            elif is_frontmatter_unique:
+                group_item.setText(0, f"Unique Frontmatter File ({len(files)} files)")
                 group_item.setIcon(0, QIcon.fromTheme("edit-copy"))
+                group_item.setText(1, group_size_text)  # Show total size for the group
+                group_item.setBackground(0, QBrush(QColor(230, 255, 230)))  # Light green background
+            elif is_frontmatter_group:
+                # Get tags to show in group name
+                tags = []
+                for file in files:
+                    if 'tags' in file and file['tags']:
+                        tags.extend(file['tags'])
+                tags = list(set(tags))  # Remove duplicates
+                tag_str = ", ".join(tags[:3])
+                if len(tags) > 3:
+                    tag_str += "..."
+                
+                group_item.setText(0, f"Frontmatter Group: [{tag_str}] ({len(files)} files){large_group_warning}")
+                group_item.setIcon(0, QIcon.fromTheme("edit-copy"))
+                group_item.setText(1, group_size_text)  # Show total size for the group
                 group_item.setBackground(0, QBrush(QColor(255, 240, 200)))  # Light yellow background
             elif is_content_group:
                 group_item.setText(0, f"Content Group: {group_name} ({len(files)} files) - 100% IDENTICAL{large_group_warning}")
                 group_item.setIcon(0, QIcon.fromTheme("edit-copy"))
+                group_item.setText(1, group_size_text)  # Show total size for the group
                 # Highlight content groups more prominently
                 group_item.setBackground(0, QBrush(QColor(200, 230, 255)))  # Light blue background
                 
@@ -954,6 +1149,7 @@ class NotesDuplicateDialog(QDialog):
             else:
                 group_item.setText(0, f"Duplicate Group: {group_name} ({len(files)} files){large_group_warning}")
                 group_item.setIcon(0, QIcon.fromTheme("edit-copy"))
+                group_item.setText(1, group_size_text)  # Show total size for the group
             
             # Check if any file is marked as original
             has_original = any(f.get('is_original', False) for f in files)
@@ -986,7 +1182,14 @@ class NotesDuplicateDialog(QDialog):
                 
                 # Sixth column: status
                 status_text = ""
-                if is_suffix_group:
+                if is_empty_unique:
+                    # For unique empty files, don't mark them as duplicates
+                    status_text = "Empty File"
+                    item.setBackground(0, QBrush(QColor(220, 220, 255)))  # Light blue for unique empty
+                elif is_frontmatter_unique:
+                    status_text = "Frontmatter-Only File"
+                    item.setBackground(0, QBrush(QColor(230, 255, 230)))  # Light green
+                elif is_suffix_group:
                     if file_info.get('is_original', False):
                         status_text = "Original"
                         item.setBackground(0, QBrush(QColor(200, 255, 200)))  # Light green for original
@@ -995,7 +1198,7 @@ class NotesDuplicateDialog(QDialog):
                         status_text = f"Duplicate (suffix: {suffix})"
                         total_duplicates += 1
                         item.setBackground(0, QBrush(QColor(255, 230, 200)))  # Light orange for duplicates
-                elif is_empty_file_group:
+                elif is_empty_group:
                     if file_info.get('is_original', False):
                         status_text = "Original (Empty File)"
                         item.setBackground(0, QBrush(QColor(200, 255, 200)))  # Light green for original
@@ -1024,14 +1227,14 @@ class NotesDuplicateDialog(QDialog):
                 
                 # Seventh column: Content Match
                 # For content groups, all files have matching content
-                if is_empty_file_group:
-                    item.setText(6, "EMPTY FILES")
-                    item.setForeground(6, QBrush(QColor(255, 0, 0)))  # Red text
-                    item.setToolTip(6, "These files are empty (0 bytes)")
-                elif is_frontmatter_group:
+                if is_empty_unique or is_empty_group:
+                    item.setText(6, "EMPTY FILE")
+                    item.setForeground(6, QBrush(QColor(100, 100, 255)))  # Blue text
+                    item.setToolTip(6, "This file is empty (0 bytes)")
+                elif is_frontmatter_unique or is_frontmatter_group:
                     item.setText(6, "FRONTMATTER ONLY")
                     item.setForeground(6, QBrush(QColor(255, 140, 0)))  # Orange text
-                    item.setToolTip(6, "These files only contain YAML frontmatter, no content")
+                    item.setToolTip(6, "This file only contains YAML frontmatter, no content")
                 elif is_content_group:
                     item.setText(6, "YES - 100% IDENTICAL")
                     item.setForeground(6, QBrush(QColor(0, 128, 0)))  # Green text
@@ -1052,7 +1255,7 @@ class NotesDuplicateDialog(QDialog):
             total_groups += 1
         
         # Update status
-        self.progress_label.setText(f"Found {total_groups} groups with {total_duplicates} duplicate notes")
+        self.progress_label.setText(f"Found {total_groups} groups with {total_duplicates} duplicate files")
         
         # Resize columns
         for i in range(7):
@@ -1061,10 +1264,13 @@ class NotesDuplicateDialog(QDialog):
         # Enable the buttons
         self.enable_all_buttons(True)
     
-    def auto_select_duplicates(self):
+    def auto_select_duplicates(self, select_all=False):
         """Automatically select duplicate items based on selected strategy"""
         strategy = self.select_strategy_combo.currentText()
         custom_pattern = self.custom_pattern_edit.text() if strategy == "Match pattern" else None
+        
+        # Track how many items were selected
+        selected_count = 0
         
         # Loop through all groups in the results tree
         for group_idx in range(self.results_tree.topLevelItemCount()):
@@ -1123,27 +1329,84 @@ class NotesDuplicateDialog(QDialog):
                 if sorted_items:
                     selected_items = sorted_items[1:]  # Select all except the first (longest)
             
+            elif strategy == "Keep non-suffixed":
+                # Special strategy to identify and select files with common duplicate suffixes
+                common_suffixes = ["-surfacepro6", "-DESKTOP-AKQD6B9", "-laptop", " copy", " (copy)", " (1)"]
+                
+                # First identify items without these suffixes
+                non_suffixed_items = []
+                suffixed_items = []
+                
+                for item in items:
+                    filename = os.path.basename(item.text(4))
+                    base_name = os.path.splitext(filename)[0]
+                    
+                    has_suffix = False
+                    for suffix in common_suffixes:
+                        if suffix in base_name:
+                            suffixed_items.append(item)
+                            has_suffix = True
+                            break
+                    
+                    if not has_suffix:
+                        non_suffixed_items.append(item)
+                
+                # If we have both types, keep non-suffixed and select suffixed
+                if non_suffixed_items and suffixed_items:
+                    selected_items = suffixed_items
+                # If all have suffixes, keep the oldest and select the rest
+                elif not non_suffixed_items and suffixed_items:
+                    try:
+                        sorted_items = sorted(items, key=lambda x: os.path.getmtime(x.text(4)))
+                        selected_items = sorted_items[1:]  # Select all except the oldest
+                    except:
+                        # Fallback: select all but first
+                        selected_items = items[1:]
+                # Otherwise, just keep the default (no selection)
+                else:
+                    selected_items = []
+            
             elif strategy == "Match pattern":
                 if custom_pattern:
                     try:
                         pattern = re.compile(custom_pattern)
-                        # Select files whose path matches the pattern
-                        for item in items:
-                            if pattern.search(item.text(4)):  # Path is in column 4
-                                selected_items.append(item)
+                        # Special case: if pattern is simply "Duplicate", match status column
+                        if custom_pattern.lower() == "duplicate":
+                            # Select all items marked as duplicates
+                            for item in items:
+                                if "Duplicate" in item.text(5):  # Status is in column 5
+                                    selected_items.append(item)
+                        else:
+                            # Otherwise use pattern on all columns
+                            for item in items:
+                                # Check all visible columns
+                                for col in range(6):  # Check first 6 columns
+                                    if pattern.search(item.text(col)):
+                                        selected_items.append(item)
+                                        break
                     except re.error:
                         QMessageBox.warning(self, "Invalid Pattern", 
-                                           f"The pattern '{custom_pattern}' is not a valid regular expression.")
+                                          f"The pattern '{custom_pattern}' is not a valid regular expression.")
+                else:
+                    # If no pattern specified, select all duplicates by default
+                    for item in items:
+                        if "Original" not in item.text(5):  # Select non-originals
+                            selected_items.append(item)
             
             # Check/uncheck items based on selection
             for item in items:
                 if item in selected_items:
                     item.setCheckState(0, Qt.CheckState.Checked)
+                    selected_count += 1
                 else:
                     item.setCheckState(0, Qt.CheckState.Unchecked)
         
         # Update the count of selected items
         self.update_selection_count()
+        
+        # Show a status message
+        if selected_count > 0:
+            self.status_label.setText(f"Auto-selected {selected_count} duplicate files")
     
     def clear_selection(self):
         """Clear all selections in the results tree"""
@@ -1657,14 +1920,17 @@ class NotesDuplicateDialog(QDialog):
             return
         
         # Find the group containing the selected item(s)
-        group_items = set()
+        group_items = []
         for item in current_items:
             # If item is a top-level item (group), add it directly
             if item.parent() is None:
-                group_items.add(item)
+                if item not in group_items:
+                    group_items.append(item)
             # Otherwise, add its parent (the group)
             else:
-                group_items.add(item.parent())
+                parent = item.parent()
+                if parent not in group_items:
+                    group_items.append(parent)
         
         # Unselect all items in the identified groups
         for group in group_items:
@@ -1677,7 +1943,7 @@ class NotesDuplicateDialog(QDialog):
         self.update_selection_count()
         
         if len(group_items) == 1:
-            group_name = next(iter(group_items)).text(0)
+            group_name = group_items[0].text(0)
             self.progress_label.setText(f"Unselected all items in group: {group_name}")
         else:
             self.progress_label.setText(f"Unselected items in {len(group_items)} groups")
@@ -1686,16 +1952,31 @@ class NotesDuplicateDialog(QDialog):
         """Compare selected notes with their original versions"""
         root = self.results_tree.invisibleRootItem()
         
-        # First collect all selected items with their originals
+        # First step: Verify duplicates with content hashes
+        self.verify_duplicates_content(root)
+        
+        # Now collect all selected items with their originals
         originals = {}  # Maps original paths to original items
         duplicates = {}  # Maps original paths to list of duplicate items
         identical_duplicates = {}  # Maps original paths to list of identical duplicates
         different_duplicates = {}  # Maps original paths to list of different duplicates
+        empty_files = []  # List of empty files
         
         # Collect all items and organize them
         for i in range(root.childCount()):
             group = root.child(i)
-            is_content_group = "content_" in group.text(0) if isinstance(group.text(0), str) else False
+            
+            # Skip groups without a group heading (shouldn't happen, but just in case)
+            if not group or not hasattr(group, 'text'):
+                continue
+            
+            group_text = group.text(0)
+            is_content_group = "content_" in group_text.lower() if isinstance(group_text, str) else False
+            is_suffix_group = "suffix" in group_text.lower() if isinstance(group_text, str) else False
+            
+            # Always verify content for accurate comparison
+            strict_verification = True
+            suffix_verification = is_suffix_group
             
             original_item = None
             selected_duplicates = []
@@ -1703,7 +1984,7 @@ class NotesDuplicateDialog(QDialog):
             # First find the original in this group
             for j in range(group.childCount()):
                 item = group.child(j)
-                if "Original" in item.text(5):
+                if item.text(5) and "Original" in item.text(5):
                     original_item = item
                     break
             
@@ -1715,22 +1996,86 @@ class NotesDuplicateDialog(QDialog):
                 continue
                 
             original_path = original_item.text(4)
+            
+            # Check if original is an empty file - get the size from the tree
+            original_size = 0
+            try:
+                size_text = original_item.text(1)  # Size is in column 1
+                if size_text:
+                    # Remove any "B", "KB", etc. and convert to integer
+                    size_text = size_text.split()[0].strip()
+                    original_size = float(size_text)
+                    if "KB" in original_item.text(1):
+                        original_size *= 1024
+                    elif "MB" in original_item.text(1):
+                        original_size *= 1024 * 1024
+            except:
+                # If we can't parse size, get it from the file
+                try:
+                    original_size = os.path.getsize(original_path)
+                except:
+                    original_size = 0
+            
+            # Skip empty file groups entirely
+            if original_size == 0 and "empty" in group.text(0).lower():
+                # Instead, collect them in a separate list
+                for j in range(group.childCount()):
+                    item = group.child(j)
+                    if item.checkState(0) == Qt.CheckState.Checked:
+                        empty_files.append(item)
+                continue
+                
             originals[original_path] = original_item
             
             # Now collect selected duplicates
             for j in range(group.childCount()):
                 item = group.child(j)
                 if item.checkState(0) == Qt.CheckState.Checked:
-                    # Don't include the original itself
+                    # Don't include the original itself if it was checked
                     if item != original_item:
-                        selected_duplicates.append(item)
+                        # Get file paths
+                        file_path = item.text(4)
                         
-                        # Categorize as identical or different
-                        if is_content_group or item.text(6) == "YES - 100% IDENTICAL":
+                        # Skip empty files for duplication analysis
+                        file_size = 0
+                        try:
+                            size_text = item.text(1)  # Size is in column 1
+                            if size_text:
+                                size_text = size_text.split()[0].strip()
+                                file_size = float(size_text)
+                                if "KB" in item.text(1):
+                                    file_size *= 1024
+                                elif "MB" in item.text(1):
+                                    file_size *= 1024 * 1024
+                        except:
+                            try:
+                                file_size = os.path.getsize(file_path)
+                            except:
+                                file_size = 0
+                        
+                        if file_size == 0:
+                            empty_files.append(item)
+                            continue
+                        
+                        # Verify file exists
+                        if not os.path.exists(file_path):
+                            continue
+                        
+                        # Always verify if files are actual duplicates by content
+                        is_identical = self.verify_files_are_duplicates(original_path, file_path)
+                        
+                        # Update status in the UI
+                        if is_identical:
+                            item.setText(6, "YES - 100% IDENTICAL")
+                            # Add to identical duplicates
                             if original_path not in identical_duplicates:
                                 identical_duplicates[original_path] = []
                             identical_duplicates[original_path].append(item)
+                            # Also add to selected duplicates
+                            selected_duplicates.append(item)
                         else:
+                            item.setText(6, "NO - DIFFERENT CONTENT")
+                            # Add to different duplicates for review
                             if original_path not in different_duplicates:
                                 different_duplicates[original_path] = []
                             different_duplicates[original_path].append(item)
@@ -1738,20 +2083,37 @@ class NotesDuplicateDialog(QDialog):
             if selected_duplicates:
                 duplicates[original_path] = selected_duplicates
         
+        # Handle empty files specially
+        if empty_files:
+            self.handle_empty_files(empty_files)
+        
         # Check if anything is selected
-        if not duplicates:
-            QMessageBox.information(self, "No Selection", "No duplicate notes selected for comparison.")
+        if not duplicates and not different_duplicates:
+            if not empty_files:  # Only show this if we didn't handle empty files
+                QMessageBox.information(self, "No Selection", "No duplicate notes selected for comparison.")
             return
-            
-        # Count the items
+        
+        # If no duplicates were found after verification, show message and return
         identical_count = sum(len(items) for items in identical_duplicates.values())
         different_count = sum(len(items) for items in different_duplicates.values())
         
+        if identical_count == 0 and different_count == 0:
+            QMessageBox.information(
+                self,
+                "No Valid Duplicates",
+                "No valid duplicates were found among your selection. The files may have different content or may not be actual duplicates."
+            )
+            return
+            
         # If we have identical duplicates, offer to auto-delete them
         auto_deleted = 0
         if identical_count > 0:
+            # Create a preview of files to be deleted
+            preview_text = self.create_duplicate_preview(identical_duplicates)
+            
             message = (f"Found {identical_count} duplicates with identical content to their originals.\n\n"
-                      f"Would you like to automatically delete these identical duplicates?")
+                      f"Would you like to automatically delete these identical duplicates?\n\n"
+                      f"Preview of files to be deleted (first 10 shown):\n{preview_text}")
             
             response = QMessageBox.question(
                 self,
@@ -1781,8 +2143,12 @@ class NotesDuplicateDialog(QDialog):
         
         # If we have different duplicates, proceed with manual review
         if different_count > 0:
+            # Create a preview of files to be compared
+            preview_text = self.create_duplicate_preview(different_duplicates)
+            
             message = (f"Found {different_count} duplicates with differences from their originals.\n\n"
-                      f"Would you like to review these files individually?")
+                      f"Would you like to review these files individually?\n\n"
+                      f"Preview of files to be compared (first 10 shown):\n{preview_text}")
             
             response = QMessageBox.question(
                 self,
@@ -1868,6 +2234,262 @@ class NotesDuplicateDialog(QDialog):
                 "No files were processed. Please select some duplicates and try again."
             )
     
+    def verify_duplicates_content(self, root):
+        """Verify content similarity for all files in the tree"""
+        try:
+            # First collect originals and duplicates by group
+            for i in range(root.childCount()):
+                group = root.child(i)
+                group_text = group.text(0)
+                
+                # Skip content groups since they're already verified
+                if "content_" in group_text.lower():
+                    continue
+                
+                # Focus on suffix groups which need verification
+                if "suffix" not in group_text.lower():
+                    continue
+                
+                # Find the original
+                original_item = None
+                for j in range(group.childCount()):
+                    item = group.child(j)
+                    if item.text(5) and "Original" in item.text(5):
+                        original_item = item
+                        break
+                
+                # If no original, use first item
+                if not original_item and group.childCount() > 0:
+                    original_item = group.child(0)
+                
+                if not original_item:
+                    continue
+                
+                # Get original content hash
+                original_path = original_item.text(4)
+                
+                # Now verify each potential duplicate
+                for j in range(group.childCount()):
+                    item = group.child(j)
+                    if item != original_item:
+                        dup_path = item.text(4)
+                        
+                        # Check actual content similarity
+                        is_identical = self.verify_files_are_duplicates(original_path, dup_path)
+                        
+                        # Update the item's status in column 6
+                        if is_identical:
+                            item.setText(6, "YES - 100% IDENTICAL")
+                        else:
+                            item.setText(6, "NO - DIFFERENT CONTENT")
+        
+        except Exception as e:
+            print(f"Error verifying duplicates: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def verify_files_are_duplicates(self, file1_path, file2_path):
+        """Verify if two files are actual duplicates by comparing content"""
+        try:
+            # Check if files exist
+            if not os.path.exists(file1_path) or not os.path.exists(file2_path):
+                return False
+            
+            # Check file sizes (quick check)
+            size1 = os.path.getsize(file1_path)
+            size2 = os.path.getsize(file2_path)
+            
+            # Different sizes = definitely different content
+            if size1 != size2:
+                return False
+            
+            # For empty files, consider them unique
+            if size1 == 0 and size2 == 0:
+                return False
+            
+            # Calculate and compare hashes
+            with open(file1_path, 'rb') as f1, open(file2_path, 'rb') as f2:
+                # Read the files in chunks to handle large files
+                chunk_size = 4096
+                identical = True
+                
+                while True:
+                    chunk1 = f1.read(chunk_size)
+                    chunk2 = f2.read(chunk_size)
+                    
+                    if chunk1 != chunk2:
+                        identical = False
+                        break
+                    
+                    if not chunk1:  # End of file
+                        break
+                
+                return identical
+        
+        except Exception as e:
+            print(f"Error comparing files {os.path.basename(file1_path)} and {os.path.basename(file2_path)}: {e}")
+            return False
+    
+    def create_duplicate_preview(self, duplicate_map):
+        """Create a preview of files in the duplicate map"""
+        preview_lines = []
+        count = 0
+        
+        for original_path, items in duplicate_map.items():
+            original_name = os.path.basename(original_path)
+            
+            for item in items:
+                if count >= 10:  # Limit to 10 entries
+                    preview_lines.append("... and more ...")
+                    break
+                    
+                duplicate_path = item.text(4)
+                duplicate_name = os.path.basename(duplicate_path)
+                size_text = item.text(1)
+                
+                preview_lines.append(f"• {duplicate_name} ({size_text}) → original: {original_name}")
+                count += 1
+            
+            if count >= 10:
+                break
+        
+        return "\n".join(preview_lines)
+    
+    def handle_empty_files(self, empty_files):
+        """Handle empty files with special care"""
+        if not empty_files:
+            return
+            
+        count = len(empty_files)
+        
+        # Create a preview of the empty files
+        preview_lines = []
+        for i, item in enumerate(empty_files[:10]):  # Show first 10
+            file_path = item.text(4)
+            file_name = os.path.basename(file_path)
+            preview_lines.append(f"• {file_name}")
+        
+        if len(empty_files) > 10:
+            preview_lines.append("... and more ...")
+            
+        preview_text = "\n".join(preview_lines)
+        
+        # Ask what to do with empty files
+        message = (f"Found {count} empty files (0 bytes).\n\n"
+                  f"Empty files should be handled separately as they may have unique filenames but no content.\n\n"
+                  f"Files:\n{preview_text}\n\n"
+                  f"What would you like to do with these empty files?")
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Empty Files Found")
+        layout = QVBoxLayout(dialog)
+        
+        # Information
+        info_label = QLabel(message)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Options
+        option_group = QGroupBox("Choose an action for empty files:")
+        option_layout = QVBoxLayout(option_group)
+        
+        delete_button = QPushButton("Delete All Empty Files")
+        delete_button.setStyleSheet("background-color: #ffcccc;")
+        delete_button.clicked.connect(lambda: self.set_empty_file_action(dialog, "delete"))
+        option_layout.addWidget(delete_button)
+        
+        skip_button = QPushButton("Skip (Keep All Empty Files)")
+        skip_button.setStyleSheet("background-color: #ccffcc;")
+        skip_button.clicked.connect(lambda: self.set_empty_file_action(dialog, "skip"))
+        option_layout.addWidget(skip_button)
+        
+        view_button = QPushButton("View Each File Individually")
+        view_button.clicked.connect(lambda: self.set_empty_file_action(dialog, "view"))
+        option_layout.addWidget(view_button)
+        
+        layout.addWidget(option_group)
+        
+        # Store result
+        dialog.action_result = "skip"  # Default
+        
+        # Show dialog
+        dialog.exec()
+        
+        # Process the choice
+        action = dialog.action_result
+        
+        if action == "delete":
+            # Confirm deletion
+            confirm = QMessageBox.question(
+                self,
+                "Confirm Deletion",
+                f"Are you sure you want to delete all {count} empty files?\n\nThis cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if confirm == QMessageBox.StandardButton.Yes:
+                deleted, errors = self.delete_empty_files(empty_files)
+                
+                if errors:
+                    QMessageBox.warning(
+                        self,
+                        "Deletion Errors",
+                        f"Deleted {deleted} out of {count} empty files with {len(errors)} errors:\n\n" + 
+                        "\n".join(errors[:10])
+                    )
+                else:
+                    QMessageBox.information(
+                        self,
+                        "Deletion Complete",
+                        f"Successfully deleted {deleted} empty files."
+                    )
+                
+                self.status_label.setText(f"Deleted {deleted} empty files")
+        
+        elif action == "view":
+            # For now, just show a message - we can implement individual review later if needed
+            QMessageBox.information(
+                self,
+                "View Empty Files",
+                "Individual review of empty files is not yet implemented. Please use the select/unselect checkboxes in the tree view to mark files for deletion."
+            )
+    
+    def set_empty_file_action(self, dialog, action):
+        """Set the action for empty files and close dialog"""
+        dialog.action_result = action
+        dialog.accept()
+    
+    def delete_empty_files(self, empty_files):
+        """Delete all empty files"""
+        deleted_count = 0
+        errors = []
+        
+        for item in empty_files:
+            try:
+                file_path = item.text(4)  # Path is in column 4
+                if os.path.exists(file_path):
+                    # Double check that it's actually empty
+                    if os.path.getsize(file_path) == 0:
+                        os.remove(file_path)
+                        deleted_count += 1
+                        
+                        # Remove the item from the tree
+                        parent = item.parent()
+                        if parent:
+                            parent.removeChild(item)
+                            
+                            # If group is now empty, remove it
+                            if parent.childCount() <= 1:  # Only original left
+                                idx = self.results_tree.indexOfTopLevelItem(parent)
+                                if idx >= 0:
+                                    self.results_tree.takeTopLevelItem(idx)
+                    else:
+                        errors.append(f"File is not empty: {os.path.basename(file_path)}")
+            except Exception as e:
+                errors.append(f"Error deleting {os.path.basename(file_path)}: {str(e)}")
+        
+        return deleted_count, errors
+    
     def delete_identical_duplicates(self, identical_duplicates):
         """Delete all identical duplicates automatically"""
         deleted_count = 0
@@ -1875,15 +2497,40 @@ class NotesDuplicateDialog(QDialog):
         
         # Process each group of identical duplicates
         for original_path, items in identical_duplicates.items():
+            # Verify that original exists and has content
+            if not os.path.exists(original_path):
+                errors.append(f"Original file not found: {os.path.basename(original_path)}")
+                continue
+                
+            original_size = os.path.getsize(original_path)
+            if original_size == 0:
+                errors.append(f"Original file is empty: {os.path.basename(original_path)}")
+                continue
+            
             for item in items:
                 try:
                     file_path = item.text(4)  # Path is in column 4
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                        deleted_count += 1
+                    if not os.path.exists(file_path):
+                        errors.append(f"File not found: {os.path.basename(file_path)}")
+                        continue
                         
-                        # Remove the item from the tree
-                        parent = item.parent()
+                    # Double check file sizes match (non-zero)
+                    duplicate_size = os.path.getsize(file_path)
+                    if duplicate_size == 0:
+                        errors.append(f"Skipping empty file: {os.path.basename(file_path)}")
+                        continue
+                        
+                    if duplicate_size != original_size:
+                        errors.append(f"File size mismatch: {os.path.basename(file_path)}")
+                        continue
+                    
+                    # Proceed with deletion
+                    os.remove(file_path)
+                    deleted_count += 1
+                    
+                    # Remove the item from the tree
+                    parent = item.parent()
+                    if parent:
                         parent.removeChild(item)
                         
                         # If group is now empty, remove it
@@ -2407,4 +3054,340 @@ class NotesDuplicateDialog(QDialog):
                 'file1': os.path.basename(file1),
                 'file2': os.path.basename(file2)
             }
+
+    def show_context_menu(self, position):
+        """Show context menu for the results tree"""
+        # Get the item at the position
+        item = self.results_tree.itemAt(position)
+        if not item:
+            return
+            
+        # Don't show context menu for group items (top-level)
+        if item.parent() is None:
+            return
+            
+        # Create context menu
+        context_menu = QMenu(self)
+        
+        # Add actions
+        preview_action = context_menu.addAction("Preview File")
+        open_action = context_menu.addAction("Open File")
+        copy_path_action = context_menu.addAction("Copy Path")
+        context_menu.addSeparator()
+        delete_action = context_menu.addAction("Delete File")
+        
+        # Get file path from the item (column 4)
+        file_path = item.text(4)
+        
+        # Execute the menu and get the selected action
+        action = context_menu.exec(self.results_tree.viewport().mapToGlobal(position))
+        
+        # Handle actions
+        if action == preview_action:
+            self.preview_file(file_path)
+        elif action == open_action:
+            self.open_file(file_path)
+        elif action == copy_path_action:
+            QApplication.clipboard().setText(file_path)
+            self.status_label.setText(f"Copied path to clipboard: {file_path}")
+        elif action == delete_action:
+            confirm = QMessageBox.question(
+                self, 
+                "Confirm Deletion", 
+                f"Are you sure you want to delete {os.path.basename(file_path)}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                try:
+                    os.unlink(file_path)
+                    item.setText(5, "Deleted")
+                    self.status_label.setText(f"Deleted file: {file_path}")
+                except Exception as e:
+                    QMessageBox.warning(self, "Delete Failed", f"Could not delete file: {str(e)}")
+    
+    def preview_file(self, file_path):
+        """Preview file content in a dialog"""
+        try:
+            # Make sure file exists
+            if not os.path.exists(file_path):
+                QMessageBox.warning(self, "File Not Found", f"File not found: {file_path}")
+                return
+                
+            # Read file content
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            
+            # Create preview dialog
+            preview_dialog = QDialog(self)
+            preview_dialog.setWindowTitle(f"Preview: {os.path.basename(file_path)}")
+            preview_dialog.resize(700, 500)
+            
+            # Layout
+            layout = QVBoxLayout(preview_dialog)
+            
+            # File info section
+            info_layout = QHBoxLayout()
+            
+            # File size
+            size = os.path.getsize(file_path)
+            size_label = QLabel(f"Size: {self.format_size(size)}")
+            info_layout.addWidget(size_label)
+            
+            # Modified time
+            modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+            time_label = QLabel(f"Modified: {modified_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            info_layout.addWidget(time_label)
+            
+            # Add path label
+            path_label = QLabel(f"Path: {file_path}")
+            path_label.setWordWrap(True)
+            
+            layout.addLayout(info_layout)
+            layout.addWidget(path_label)
+            
+            # Text editor for content
+            text_edit = QTextEdit()
+            text_edit.setReadOnly(True)
+            text_edit.setFont(QFont("monospace"))
+            text_edit.setText(content)
+            
+            layout.addWidget(text_edit)
+            
+            # Close button
+            button_layout = QHBoxLayout()
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(preview_dialog.accept)
+            button_layout.addStretch()
+            button_layout.addWidget(close_button)
+            layout.addLayout(button_layout)
+            
+            # Show dialog
+            preview_dialog.exec()
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Preview Error", f"Error previewing file: {str(e)}")
+    
+    def open_file(self, file_path):
+        """Open file with default application"""
+        try:
+            if not os.path.exists(file_path):
+                QMessageBox.warning(self, "File Not Found", f"File not found: {file_path}")
+                return
+                
+            # Use platform-specific method to open file
+            if platform.system() == 'Windows':
+                os.startfile(file_path)
+            elif platform.system() == 'Darwin':  # macOS
+                subprocess.run(['open', file_path])
+            else:  # Linux
+                subprocess.run(['xdg-open', file_path])
+                
+            self.status_label.setText(f"Opened file: {file_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Open Failed", f"Could not open file: {str(e)}")
+
+    def copy_selected_paths(self):
+        """Copy paths of selected items to clipboard"""
+        selected_paths = []
+        
+        # Collect all selected or checked items
+        for group_idx in range(self.results_tree.topLevelItemCount()):
+            group_item = self.results_tree.topLevelItem(group_idx)
+            
+            for child_idx in range(group_item.childCount()):
+                child_item = group_item.child(child_idx)
+                # Include items that are either checked or selected
+                if child_item.checkState(0) == Qt.CheckState.Checked or child_item.isSelected():
+                    file_path = child_item.text(4)  # Path is in column 4
+                    selected_paths.append(file_path)
+        
+        if not selected_paths:
+            QMessageBox.information(self, "No Selection", "No items selected for copying paths.")
+            return
+        
+        # Copy to clipboard
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\n".join(selected_paths))
+        
+        # Update status
+        self.status_label.setText(f"Copied {len(selected_paths)} file paths to clipboard")
+
+    def update_progress(self, value, maximum):
+        """Update the progress bar"""
+        if maximum > 0:
+            percentage = (value / maximum) * 100
+            self.progress_bar.setValue(int(percentage))
+            self.progress_label.setText(f"Processing files: {value}/{maximum} ({int(percentage)}%)")
+
+    def on_error(self, error_msg):
+        """Handle errors from the worker thread"""
+        QMessageBox.critical(self, "Error", error_msg)
+        self.status_label.setText(f"Error: {error_msg}")
+        self.progress_label.setText("Failed")
+        print(f"Error in duplicate finder: {error_msg}")
+        
+        # Ensure buttons are enabled
+        self.enable_all_buttons()
+
+    def process_duplicates(self, duplicates):
+        """Process duplicate results from worker"""
+        # Make results visible regardless of whether duplicates were found
+        self.results_group.setVisible(True)
+        
+        # Log what we received for debugging
+        print(f"Received duplicate results: {len(duplicates)} groups")
+        for key in duplicates.keys():
+            print(f"  Group: {key} with {len(duplicates[key])} files")
+        
+        # Special handling for empty files and frontmatter-only files
+        empty_files_to_add = []  # Completely empty files (0 bytes)
+        frontmatter_files = []   # Files with only frontmatter, no content
+        keys_to_remove = []
+        
+        for key, files in list(duplicates.items()):
+            # Check if these are empty files (0 bytes)
+            if all(f.get('size', 0) == 0 for f in files):
+                # Extract these files for special handling
+                for file in files:
+                    # Mark each empty file as its own "original" if they have different names
+                    file['is_original'] = True
+                    file['is_empty'] = True
+                    empty_files_to_add.append(file)
+                keys_to_remove.append(key)
+            
+            # Check for frontmatter-only files
+            elif any(f.get('is_frontmatter_only', False) for f in files):
+                # Extract these files for special handling
+                for file in files:
+                    frontmatter_files.append(file)
+                keys_to_remove.append(key)
+            
+            # Also check for content groups that are actually empty files or frontmatter-only
+            # This is a fallback check if the worker didn't properly identify them
+            elif "content_" in str(key):
+                is_empty_group = True
+                is_frontmatter_group = True
+                
+                for file in files:
+                    file_path = file.get('path', '')
+                    try:
+                        # Check if file is empty
+                        if os.path.getsize(file_path) > 0:
+                            is_empty_group = False
+                            
+                            # Check if file has only frontmatter
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                            if not content.startswith('---'):
+                                is_frontmatter_group = False
+                            elif '---' in content[3:]:
+                                # Check if there's content after frontmatter
+                                parts = content.split('---', 2)
+                                if len(parts) >= 3 and parts[2].strip():
+                                    is_frontmatter_group = False
+                    except Exception:
+                        is_empty_group = False
+                        is_frontmatter_group = False
+                
+                if is_empty_group:
+                    # These are empty files misidentified as content group
+                    for file in files:
+                        file['is_original'] = True
+                        file['is_empty'] = True
+                        empty_files_to_add.append(file)
+                    keys_to_remove.append(key)
+                elif is_frontmatter_group:
+                    # These are frontmatter-only files misidentified as content group
+                    for file in files:
+                        file['is_frontmatter_only'] = True
+                        frontmatter_files.append(file)
+                    keys_to_remove.append(key)
+                    
+        # Remove files that we'll handle separately
+        for key in keys_to_remove:
+            if key in duplicates:
+                del duplicates[key]
+                
+        # Group empty files by basename to find true duplicates
+        if empty_files_to_add:
+            empty_files_by_name = {}
+            for file in empty_files_to_add:
+                basename = os.path.basename(file['path'])
+                if basename not in empty_files_by_name:
+                    empty_files_by_name[basename] = []
+                empty_files_by_name[basename].append(file)
+            
+            # Add duplicate empty files as groups, and unique ones separately
+            unique_empty_files = []
+            for basename, files in empty_files_by_name.items():
+                if len(files) > 1:
+                    # These are actual duplicate empty files (same name)
+                    # Sort by modified time and mark newest as original
+                    files.sort(key=lambda x: x.get('modified', 0), reverse=True)
+                    files[0]['is_original'] = True
+                    for i in range(1, len(files)):
+                        files[i]['is_original'] = False
+                    duplicates[f'empty_{basename}'] = files
+                else:
+                    # Unique empty file - add to collection for a separate group
+                    unique_empty_files.extend(files)
+            
+            # Add all unique empty files as a single group
+            if unique_empty_files:
+                duplicates['empty_files_unique'] = unique_empty_files
+        
+        # Group frontmatter-only files by their tags to find duplicates
+        if frontmatter_files:
+            # First group by tags
+            frontmatter_by_tags = {}
+            for file in frontmatter_files:
+                tags_key = ','.join(sorted(file.get('tags', [])))
+                if tags_key not in frontmatter_by_tags:
+                    frontmatter_by_tags[tags_key] = []
+                frontmatter_by_tags[tags_key].append(file)
+            
+            # Process each group
+            for tags_key, files in frontmatter_by_tags.items():
+                if len(files) > 1:
+                    # Sort by modified time (newest first) and mark the newest as original
+                    files.sort(key=lambda x: x.get('modified', 0), reverse=True)
+                    files[0]['is_original'] = True
+                    for i in range(1, len(files)):
+                        files[i]['is_original'] = False
+                    tag_label = tags_key[:20] + '...' if len(tags_key) > 20 else tags_key
+                    duplicates[f'frontmatter_{hash(tags_key)}'] = files
+                else:
+                    # Just one file with these tags - not a duplicate
+                    files[0]['is_original'] = True
+                    duplicates[f'frontmatter_unique_{hash(tags_key)}'] = files
+            
+        self.populate_results(duplicates)
+        self.enable_all_buttons()
+        
+        # Total up stats for the status message
+        total_groups = 0
+        total_duplicates = 0
+        for group in duplicates.values():
+            if len(group) > 1:  # Only count actual duplicate groups
+                total_groups += 1
+                total_files = len(group)
+                # Count duplicates (non-originals)
+                duplicates_in_group = sum(1 for f in group if not f.get('is_original', False))
+                total_duplicates += duplicates_in_group
+                
+        if total_groups > 0:
+            self.status_label.setText(f"Found {total_groups} duplicate groups with {total_duplicates} duplicate files")
+            
+            # Auto-select all duplicates
+            QTimer.singleShot(100, self.auto_select_duplicates)
+        else:
+            self.status_label.setText("No duplicates found")
+            # Make it clear to the user what happened
+            self.results_tree.clear()
+            no_results_item = QTreeWidgetItem(self.results_tree)
+            no_results_item.setText(0, "No duplicate notes found")
+            no_results_item.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
+        
+        self.progress_label.setText("Done")
+        self.progress_bar.setValue(100)
 

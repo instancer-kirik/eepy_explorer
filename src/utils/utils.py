@@ -7,6 +7,30 @@ import os
 import re
 import hashlib
 from datetime import datetime
+from .themes import setup_theme
+from .icons import EFileIconProvider
+
+def file_exists(path):
+    """Check if a file exists and is a file
+    
+    Args:
+        path (str): Path to check
+        
+    Returns:
+        bool: True if the path exists and is a file
+    """
+    return os.path.exists(path) and os.path.isfile(path)
+
+def dir_exists(path):
+    """Check if a directory exists and is a directory
+    
+    Args:
+        path (str): Path to check
+        
+    Returns:
+        bool: True if the path exists and is a directory
+    """
+    return os.path.exists(path) and os.path.isdir(path)
 
 def format_size(size):
     """Format file size in human readable format
@@ -135,6 +159,11 @@ def get_common_suffix_patterns():
         list: List of suffix patterns
     """
     return [
+        # Machine-specific suffixes (prioritized)
+        '-surfacepro6',
+        '-DESKTOP-AKQD6B9',
+        '-laptop',
+        # Common copy indicators
         ' copy',
         ' (copy)',
         ' (1)',
@@ -148,8 +177,7 @@ def get_common_suffix_patterns():
         ' - Copy',
         '_copy',
         ' - copy',
-        '- copy',
-        '-surfacepro6'  # Add specific machine suffix
+        '- copy'
     ]
 
 def has_suffix_pattern(filename, patterns=None):
@@ -181,4 +209,11 @@ def has_suffix_pattern(filename, patterns=None):
         if '-' in pattern and pattern in filename:
             return True, pattern
             
-    return False, None 
+    return False, None
+
+# Create a file icon provider function
+def get_file_icon(path):
+    """Get icon for a file path"""
+    from PyQt6.QtCore import QFileInfo
+    provider = EFileIconProvider()
+    return provider.icon(QFileInfo(path)) 

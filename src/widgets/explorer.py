@@ -1,16 +1,32 @@
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTreeWidgetItem, 
-                           QHBoxLayout, QSplitter, QLabel, QPushButton, QTreeWidget, QGroupBox, QTabWidget, QTreeView, 
-                           QHeaderView, QMenu, QInputDialog, QLineEdit, QMessageBox, QStackedWidget, QListView)
-from PyQt6.QtCore import Qt, QDir, QFileSystemWatcher, QEventLoop, QSize, QModelIndex
-from PyQt6.QtGui import QFileSystemModel, QIcon, QStandardItemModel, QStandardItem
+import os
+import sys
+import time
+import platform
+import subprocess
+import asyncio
+import logging
+from datetime import datetime
 from pathlib import Path
+
+from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, 
+                           QSplitter, QLabel, QPushButton, QTreeView, QFileDialog,
+                           QLineEdit, QComboBox, QMenu, QMessageBox, QToolBar,
+                           QStatusBar, QTabWidget, QApplication, QListView,
+                           QListWidget, QListWidgetItem, QProgressDialog, QDialog,
+                           QDialogButtonBox, QFormLayout, QGroupBox, QHeaderView,
+                           QInputDialog, QStackedWidget, QTreeWidget, QTreeWidgetItem)
+from PyQt6.QtGui import (QAction, QKeySequence, QColor, QIcon, 
+                       QStandardItemModel, QStandardItem, QFileSystemModel)
+from PyQt6.QtCore import (Qt, QDir, QModelIndex, QSize, 
+                        QEventLoop, QFileSystemWatcher, QProcess, pyqtSignal,
+                        QItemSelectionModel, QSortFilterProxyModel)
 from .toolbar import setup_toolbar
 from .preview import update_preview
 from ..tools.project import set_project_root
 from ..tools.build import BuildManager
 from .address_bar import AddressBar
 from ..tools.vcs import VCSManager
-from ..utils.themes import setup_theme
+from ..utils.utils import setup_theme
 from ..utils.file_ops import FileOperations
 from .tools.test_tool import TestTool
 from ..views.test_results import TestResultsView
@@ -18,13 +34,25 @@ from .notes_duplicate_dialog import NotesDuplicateDialog  # For finding duplicat
 from ..tools.command_manager import CommandManager
 from ..tools.launch_manager import LaunchManager
 from ..tools.notes_manager import NotesManager
-import subprocess
-import os
+from ..tools.sync_manager import DirectorySyncManager
 import json
-import asyncio
-from qasync import QEventLoop
 import magic
 import psutil
+from qasync import QEventLoop
+
+# Import local modules
+from ..utils.utils import setup_theme, get_file_icon, file_exists, dir_exists
+from ..utils.dialogs import FileConflictDialog
+from ..tools.build import BuildManager
+from .tools.test_tool import TestTool
+from ..tools.vcs import VCSManager
+from ..tools.command_manager import CommandManager
+from ..tools.launch_manager import LaunchManager
+from ..tools.notes_manager import NotesManager
+from ..tools.sync_manager import DirectorySyncManager
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
 class EExplorer(QMainWindow):
     def __init__(self):
@@ -37,6 +65,7 @@ class EExplorer(QMainWindow):
         self.test_tool = TestTool(self)
         self.command_manager = CommandManager(self)
         self.launch_manager = LaunchManager(self)
+        self.sync_manager = DirectorySyncManager(self)
         
         # Initialize state variables
         self.file_history = []
@@ -73,39 +102,129 @@ class EExplorer(QMainWindow):
         
         # Refresh drives list
         self.refresh_drives()
+        
+        # Check for scheduled syncs on startup
+        self.sync_manager.check_schedule_on_startup()
+        
+        # Check UI integrity after initialization
+        self.check_ui_integrity()
+    
+    def check_ui_integrity(self):
+        """Check if the UI is properly set up and fix any issues"""
+        # Check if address bar exists
+        if not hasattr(self, 'address_bar') or self.address_bar is None:
+            print("Address bar is missing, recreating it")
+            self.recreate_address_bar()
+            
+        # Check if mode buttons exist
+        if not hasattr(self, 'file_mode_btn') or not hasattr(self, 'project_mode_btn') or not hasattr(self, 'notes_mode_btn'):
+            print("Mode buttons are missing, recreating toolbar")
+            # Try to recreate toolbar
+            if hasattr(self, 'toolbar'):
+                # Clear existing toolbar
+                while self.toolbar.actions():
+                    self.toolbar.removeAction(self.toolbar.actions()[0])
+                    
+                # Create new toolbar widget
+                toolbar_widget = QWidget()
+                toolbar_layout = QHBoxLayout(toolbar_widget)
+                toolbar_layout.setContentsMargins(0, 0, 0, 0)
+                
+                # Setup toolbar 
+                try:
+                    setup_toolbar(self, toolbar_layout)
+                    self.toolbar.addWidget(toolbar_widget)
+                    print("Toolbar recreated successfully")
+                except Exception as e:
+                    print(f"Error recreating toolbar: {str(e)}")
+                    
+        # Check if current_view is set
+        if not hasattr(self, 'current_view') or self.current_view is None:
+            print("Current view is not set, fixing")
+            if hasattr(self, 'tree_view'):
+                self.current_view = self.tree_view
+                print("Set current view to tree view")
+            elif hasattr(self, 'list_view'):
+                self.current_view = self.list_view
+                print("Set current view to list view")
+                
+        # Navigate to home directory if we don't have a current location
+        try:
+            if self.current_mode == 'file':
+                current_path = self.get_current_path()
+                if not current_path or not os.path.exists(current_path):
+                    home_path = os.path.expanduser("~")
+                    print(f"No valid current path, navigating to home: {home_path}")
+                    self.navigate_to_path(home_path)
+        except Exception as e:
+            print(f"Error checking current path: {str(e)}")
     
     def setup_ui(self):
         """Initialize the main UI components"""
-        # Window setup
-        self.setWindowTitle("EEPY Explorer")
-        self.setGeometry(100, 100, 1200, 800)
+        # Create main layout and toolbar
+        main_layout = QVBoxLayout()
         
-        # Status bar and project state
-        self.status_bar = self.statusBar()
-        self.project_state = QLabel()
-        self.status_bar.addPermanentWidget(self.project_state)
+        # Create toolbar container
+        self.toolbar = QToolBar()
+        self.toolbar.setMovable(False)
+        self.toolbar.setFloatable(False)
+        self.addToolBar(self.toolbar)
         
+        # Create empty lists for toolbar actions by category
+        self.file_actions = []
+        self.project_actions = []
+        self.notes_actions = []
+        
+        # Create toolbar widget
+        toolbar_widget = QWidget()
+        toolbar_layout = QHBoxLayout(toolbar_widget)
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Setup toolbar controls with our toolbar helper function
+        from .toolbar import setup_toolbar
+        try:
+            setup_toolbar(self, toolbar_layout)
+        except Exception as e:
+            print(f"Error setting up toolbar: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        
+        self.toolbar.addWidget(toolbar_widget)
+        
+        # Main widget
+        central_widget = QWidget()
+        central_widget.setLayout(main_layout)
+        self.setCentralWidget(central_widget)
+        
+        # Create navigation bar using our NavigationBar class
+        try:
+            from .navigation import NavigationBar
+            self.nav_bar = NavigationBar(self)
+            self.nav_bar.path_changed.connect(self.navigate_to_path)
+            self.nav_bar.back_requested.connect(self.navigate_back)
+            self.nav_bar.forward_requested.connect(self.navigate_forward)
+            self.nav_bar.up_requested.connect(self.navigate_up)
+            self.nav_bar.refresh_requested.connect(self.refresh_view)
+            # Connect mode change signal
+            if hasattr(self.nav_bar, 'mode_changed'):
+                self.nav_bar.mode_changed.connect(self.switch_mode)
+            # Initialize with default mode
+            if hasattr(self.nav_bar, 'set_mode'):
+                self.nav_bar.set_mode(self.current_mode)
+            # Add navigation bar to layout
+            main_layout.addWidget(self.nav_bar)
+        except Exception as e:
+            print(f"Error setting up navigation bar: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
         # Initialize file system model
         self.model = QFileSystemModel()
         self.model.setRootPath(QDir.rootPath())
         
-        # Central widget and layout
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        self.main_layout = QVBoxLayout(central_widget)
-        self.main_layout.setContentsMargins(4, 4, 4, 4)
-        self.main_layout.setSpacing(4)
-        
-        # Toolbar
-        toolbar = QWidget()
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(0, 0, 0, 0)
-        setup_toolbar(self, toolbar_layout)
-        self.main_layout.addWidget(toolbar)
-        
         # Main splitter
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.main_layout.addWidget(main_splitter)
+        main_layout.addWidget(main_splitter)
         
         # Left panel (file tree, favorites, drives)
         left_panel = QWidget()
@@ -572,426 +691,91 @@ class EExplorer(QMainWindow):
 
     def show_context_menu(self, position):
         """Show context menu for file tree"""
-        menu = QMenu()
-        indexes = self.current_view.selectedIndexes()
+        indexes = self.tree_view.selectedIndexes()
+        if not indexes:
+            return
+            
+        # Keep only indexes for column 0 (name column)
+        indexes = [index for index in indexes if index.column() == 0]
         
         if not indexes:
             return
             
-        # Get selected paths
-        selected_paths = []
-        for index in indexes:
-            if index.column() == 0:  # Only process first column to avoid duplicates
-                path = self.model.filePath(index)
-                selected_paths.append(path)
+        # Create menu
+        menu = QMenu(self)
         
-        if not selected_paths:
-            return
+        # Check if we're in file mode or notes mode
+        if self.current_mode == 'file':
+            # Get file path from the model
+            first_item_path = self.model.filePath(indexes[0])
             
-        # Single item selected
-        if len(selected_paths) == 1:
-            path = selected_paths[0]
-            
-            # Basic file operations
-            open_action = menu.addAction("Open")
-            open_action.triggered.connect(lambda: self.handle_item_double_click(indexes[0]))
-            
-            # For files, add "Open with..." submenu
-            if not os.path.isdir(path):
-                open_with_menu = menu.addMenu("Open with...")
-                apps = self.get_system_applications(path)
-                for app in apps:
-                    action = open_with_menu.addAction(app['name'])
-                    if 'icon' in app:
-                        action.setIcon(QIcon.fromTheme(app['icon']))
-                    action.triggered.connect(
-                        lambda checked, a=app: self.open_with(path, a)
-                    )
-            
-            if os.path.isdir(path):
-                open_terminal_action = menu.addAction("Open in Terminal")
-                open_terminal_action.triggered.connect(lambda: self.open_in_terminal(path))
-                
-                # Add launch submenu for directories
-                menu.addSeparator()
-                launch_menu = menu.addMenu("Launch")
-                
-                # Add detected configurations
-                configs = self.launch_manager.detect_project(path)
-                if configs:
-                    for config in configs:
-                        action = launch_menu.addAction(config['name'])
-                        action.setIcon(QIcon.fromTheme(config.get('icon', 'system-run')))
-                        action.setToolTip(config.get('description', ''))
-                        action.triggered.connect(
-                            lambda checked, c=config: self.launch_manager.launch_project(path, c)
-                        )
-                    launch_menu.addSeparator()
-                
-                # Add saved configurations
-                saved_configs = self.launch_manager.get_launches(path)
-                if saved_configs:
-                    for config in saved_configs:
-                        action = launch_menu.addAction(config['name'])
-                        action.setIcon(QIcon.fromTheme(config.get('icon', 'system-run')))
-                        action.setToolTip(config.get('description', ''))
-                        action.triggered.connect(
-                            lambda checked, c=config: self.launch_manager.launch_project(path, c)
-                        )
-                    launch_menu.addSeparator()
-                
-                # Add manage option
-                manage_action = launch_menu.addAction("Manage Configurations...")
-                manage_action.triggered.connect(lambda: self.show_launch_manager(path))
-                
-                # Add find duplicates action for directories
-                menu.addSeparator()
-                find_duplicates_action = menu.addAction("Find Duplicate Files")
-                find_duplicates_action.triggered.connect(lambda: self.find_duplicates(path))
-            
-            menu.addSeparator()
-            
-            copy_action = menu.addAction("Copy")
-            copy_action.triggered.connect(lambda: self.file_ops.copy_selected_files())
-            
-            cut_action = menu.addAction("Cut")
-            cut_action.triggered.connect(lambda: self.file_ops.cut_selected_files())
-            
-            if self.clipboard_files:
-                paste_action = menu.addAction("Paste")
-                paste_action.triggered.connect(lambda: self.file_ops.paste_files())
-            
-            menu.addSeparator()
-            
-            delete_action = menu.addAction("Delete")
-            delete_action.triggered.connect(lambda: self.file_ops.delete_selected_files())
-            
-            rename_action = menu.addAction("Rename")
-            rename_action.triggered.connect(lambda: self.file_ops.rename_file(indexes[0]))
-            
-            # Add to favorites
-            menu.addSeparator()
-            add_favorite_action = menu.addAction("Add to Favorites")
-            add_favorite_action.triggered.connect(self.add_favorite)
-            
-        # Exactly two files selected
-        elif len(selected_paths) == 2 and all(os.path.isfile(p) for p in selected_paths):
-            # Add compare action at the top
-            compare_action = menu.addAction("Compare Files")
-            compare_action.triggered.connect(lambda: self.compare_files(selected_paths[0], selected_paths[1]))
-            
-            menu.addSeparator()
-            
-            # Basic multi-select operations
-            copy_action = menu.addAction("Copy")
-            copy_action.triggered.connect(lambda: self.file_ops.copy_selected_files())
-            
-            cut_action = menu.addAction("Cut")
-            cut_action.triggered.connect(lambda: self.file_ops.cut_selected_files())
-            
-            delete_action = menu.addAction("Delete")
-            delete_action.triggered.connect(lambda: self.file_ops.delete_selected_files())
-            
-        # Multiple items selected
-        else:
-            copy_action = menu.addAction("Copy")
-            copy_action.triggered.connect(lambda: self.file_ops.copy_selected_files())
-            
-            cut_action = menu.addAction("Cut")
-            cut_action.triggered.connect(lambda: self.file_ops.cut_selected_files())
-            
-            delete_action = menu.addAction("Delete")
-            delete_action.triggered.connect(lambda: self.file_ops.delete_selected_files())
-        
-        menu.exec(self.current_view.viewport().mapToGlobal(position))
-
-    def compare_files(self, file1, file2):
-        """Open file comparison dialog"""
-        from .compare_dialog import CompareDialog
-        dialog = CompareDialog(self, file1, file2)
-        dialog.exec()
-
-    def find_duplicates(self, directory):
-        """Open duplicate finder dialog for directory"""
-        # Use the NotesDuplicateDialog which works for both files and notes
-        dialog = NotesDuplicateDialog(self)
-        dialog.scan_directory(directory)
-        dialog.exec()
-        
-    def find_duplicate_notes(self):
-        """Find and manage duplicate notes"""
-        if not hasattr(self, 'notes_manager'):
-            self.show_error("Notes mode not active")
-            return
-            
-        notes_path = self.notes_manager.get_notes_vault_path()
-        if not notes_path:
-            self.show_error("No notes directory selected")
-            return
-            
-        # Use the notes manager's duplicate finder to ensure consistency
-        self.notes_manager.find_duplicate_notes(self)
-
-    def switch_mode(self, mode):
-        """Switch between file, project, and notes modes"""
-        if mode == self.current_mode:
-            return
-        
-        print(f"Switching mode from {self.current_mode} to {mode}")
-        
-        # Store the current path if in file/project mode
-        old_path = None
-        if hasattr(self, 'model') and self.current_mode != 'notes':
-            old_path = self.model.filePath(self.current_view.rootIndex())
-        
-        # Switch to file mode
-        if mode == 'file':
-            # Update UI
-            if hasattr(self, 'file_mode_btn'):
-                self.file_mode_btn.setChecked(True)
-            if hasattr(self, 'project_mode_btn'):
-                self.project_mode_btn.setChecked(False)
-            if hasattr(self, 'notes_mode_btn'):
-                self.notes_mode_btn.setChecked(False)
-            
-            # Switch file tree to standard model
-            if hasattr(self, 'model') and hasattr(self, 'tree_view'):
-                self.tree_view.setModel(self.model)
-                self.list_view.setModel(self.model)
-            
-            # Toggle toolbar buttons visibility
-            self.toggle_toolbar_visibility(file_visible=True, project_visible=False, notes_visible=False)
-            
-            # Update status bar
-            if hasattr(self, 'project_state'):
-                self.project_state.setText("")
-            
-            # Show test view if it was previously open
-            if hasattr(self, 'test_view'):
-                self.test_view.hide()
-        
-        # Switch to project mode
-        elif mode == 'project':
-            # Update UI
-            if hasattr(self, 'file_mode_btn'):
-                self.file_mode_btn.setChecked(False)
-            if hasattr(self, 'project_mode_btn'):
-                self.project_mode_btn.setChecked(True)
-            if hasattr(self, 'notes_mode_btn'):
-                self.notes_mode_btn.setChecked(False)
-            
-            # Configure project mode
-            self.setup_project_mode()
-            
-            # Toggle toolbar buttons visibility
-            self.toggle_toolbar_visibility(file_visible=True, project_visible=True, notes_visible=False)
-            
-            # No need to navigate explicitly as setup_project_mode handles it
-        
-        # Switch to notes mode
-        elif mode == 'notes':
-            print("DEBUG: Switching to notes mode")
-            # Update UI
-            if hasattr(self, 'file_mode_btn'):
-                self.file_mode_btn.setChecked(False)
-            if hasattr(self, 'project_mode_btn'):
-                self.project_mode_btn.setChecked(False)
-            if hasattr(self, 'notes_mode_btn'):
-                self.notes_mode_btn.setChecked(True)
-            
-            # Toggle toolbar buttons visibility
-            self.toggle_toolbar_visibility(file_visible=False, project_visible=False, notes_visible=True)
-            
-            # Hide any test views
-            if hasattr(self, 'test_view'):
-                self.test_view.hide()
-            
-            # Check for notes manager
-            if not hasattr(self, 'notes_manager'):
-                print("DEBUG: Creating notes manager")
-                from ..tools.notes_manager import NotesManager
-                self.notes_manager = NotesManager(self)
-                self.notes_manager.notes_loaded.connect(self.on_notes_loaded)
-            
-            # Try to get notes model
-            print("DEBUG: Setting up notes mode")
-            model = self.notes_manager.setup_notes_mode(self)
-            
-            if model:
-                print("DEBUG: Notes model already available")
-                # Model is already available
-                self.on_notes_loaded(model)
-            else:
-                print("DEBUG: Notes model will be loaded asynchronously")
-                # Model will be loaded asynchronously
-                # on_notes_loaded will be called via signal
-            
-            # Update status bar
-            if hasattr(self, 'project_state'):
-                self.project_state.setText("")
-                
-            # Debug current state of the tree view and model
-            print(f"DEBUG: Tree view model type: {type(self.tree_view.model())}")
-            print(f"DEBUG: Tree view root index valid: {self.tree_view.rootIndex().isValid()}")
-            
-        # Update current mode
-        self.current_mode = mode
-        
-        # Only try to navigate if we're not in notes mode, since navigating while switching
-        # to notes mode can cause crashes (address bar may be temporarily invalid)
-        if old_path and mode != 'notes':
-            try:
-                # Make sure the current path is valid
-                if os.path.exists(old_path):
-                    self.navigate_to_address(old_path)
+            # Add actions based on selection
+            if len(indexes) == 1:
+                # Single selection actions
+                if os.path.isdir(first_item_path):
+                    # Directory actions
+                    menu.addAction(self.create_action("Open", lambda: self.navigate_to(indexes[0])))
+                    menu.addAction(self.create_action("Open in New Tab", lambda: self.open_in_new_tab(first_item_path)))
+                    menu.addAction(self.create_action("Open in Terminal", lambda: self.open_in_terminal(first_item_path)))
+                    
+                    # Add sync directory action
+                    menu.addAction(self.create_action("Synchronize Directory...", lambda: self.sync_directory(first_item_path)))
+                    
+                    menu.addSeparator()
+                    menu.addAction(self.create_action("New File", lambda: self.create_new_file(first_item_path)))
+                    menu.addAction(self.create_action("New Folder", lambda: self.create_new_folder(first_item_path)))
+                    
+                    if self.is_project_directory(first_item_path):
+                        menu.addSeparator()
+                        menu.addAction(self.create_action("Open as Project", lambda: self.switch_to_project_mode(first_item_path)))
+                        if hasattr(self, 'launch_manager'):
+                            menu.addAction(self.create_action("Run Project", lambda: self.show_launch_manager(first_item_path)))
                 else:
-                    print(f"Previous path no longer exists: {old_path}")
-            except Exception as e:
-                print(f"Could not navigate to {old_path} in {mode} mode: {e}")
-
-    def on_notes_loaded(self, notes_tree_model):
-        """Called when notes are loaded asynchronously"""
-        try:
-            if not notes_tree_model:
-                print("Error: Notes model is None")
-                return
-            
-            print("DEBUG: Notes model loaded, updating UI...")
-            
-            # Store reference to the model
-            self.notes_tree_model = notes_tree_model
-            
-            # Set up the views with the new model
-            self.tree_view.setModel(notes_tree_model)
-            self.list_view.setModel(notes_tree_model)
-            
-            # Always use invalid index to show root in notes mode
-            self.tree_view.setRootIndex(QModelIndex())
-            self.list_view.setRootIndex(QModelIndex())
-            
-            # Set column widths and visibility
-            self.tree_view.setColumnWidth(0, 250)  # Name column
-            self.tree_view.setColumnWidth(1, 200)  # Tags column
-            # Path column should stretch
-            self.tree_view.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-            
-            # Set up UI components for notes mode
-            self.setup_notes_mode_ui()
-            
-            # Get the notes vault path for displaying in the UI
-            notes_path = ""
-            if hasattr(self, 'notes_manager'):
-                notes_path = self.notes_manager.get_notes_vault_path()
-                print(f"DEBUG: Notes vault path: {notes_path}")
-                
-                # Update the address bar with the notes vault path (if it exists)
-                try:
-                    if hasattr(self, 'address_bar') and self.address_bar is not None:
-                        self.address_bar.setText(notes_path)
-                except RuntimeError:
-                    # Handle case where address bar has been deleted
-                    print("Warning: Address bar was deleted")
-                    pass
+                    # File actions
+                    menu.addAction(self.create_action("Open", lambda: self.handle_item_double_click(indexes[0])))
                     
-                # Display the notes path in the status bar
-                self.status_bar.showMessage(f"Notes vault: {notes_path}", 5000)
-            else:
-                print("DEBUG: No notes_manager attribute found")
-            
-            # Don't automatically expand tree - leave it collapsed
-            # self.tree_view.expandToDepth(0)
-            self.tree_view.viewport().update()
-            self.list_view.viewport().update()
-            
-            # Debug model and view state
-            print(f"DEBUG: Tree view has {notes_tree_model.rowCount(QModelIndex())} rows at root level")
-            
-            # Update UI to reflect that loading is complete
-            print("DEBUG: Notes loaded and UI updated")
-        
-        except Exception as e:
-            print(f"Error in on_notes_loaded: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-    def setup_notes_mode_ui(self):
-        """Set up UI elements specific to notes mode"""
-        # Setup tree and list view properties for notes mode
-        if hasattr(self, 'tree_view') and hasattr(self, 'notes_model'):
-            # Update tree view to use custom view
-            self.tree_view.expandToDepth(0)
-            
-            # Set up mouse press event for editing notes
-            self.tree_view.mousePressEvent = self.handle_notes_mouse_press
-            
-            # Setup list view for tags filtering
-            if hasattr(self, 'notes_tags_list'):
-                # Add tags from model
-                self.update_tags_list()
-                
-                # Connect the tags list to the filter function
-                self.notes_tags_list.clicked.connect(self.filter_notes_by_tag)
-            
-        # Enable notes-specific buttons
-        for btn in [self.tag_button, self.find_dupes_button, self.sort_button, self.search_notes_button]:
-            if hasattr(self, btn.__str__()):
-                btn.setEnabled(True)
-                
-    def update_tags_list(self):
-        """Update the tags list based on notes model"""
-        if hasattr(self, 'notes_model') and hasattr(self, 'notes_tags_list'):
-            # Clear existing tags
-            self.tag_model = QStandardItemModel()
-            self.notes_tags_list.setModel(self.tag_model)
-            
-            # Add "All" item 
-            all_item = QStandardItem("All Notes")
-            all_item.setData("all", Qt.ItemDataRole.UserRole)
-            self.tag_model.appendRow(all_item)
-            
-            # Get tags from model
-            if hasattr(self.notes_model, 'tags_map'):
-                # Add tags sorted alphabetically
-                for tag in sorted(self.notes_model.tags_map.keys()):
-                    tag_item = QStandardItem(tag)
-                    tag_item.setData(tag, Qt.ItemDataRole.UserRole)
-                    tag_item.setData(len(self.notes_model.tags_map[tag]), Qt.ItemDataRole.UserRole + 1)
-                    self.tag_model.appendRow(tag_item)
+                    # Add "Open With" submenu for files
+                    open_with_menu = QMenu("Open With", menu)
+                    applications = self.get_system_applications(first_item_path)
+                    for app_info in applications:
+                        open_with_menu.addAction(self.create_action(
+                            app_info['name'], 
+                            lambda app=app_info: self.open_with(first_item_path, app)
+                        ))
                     
-    def filter_notes_by_tag(self, index):
-        """Filter notes to only show those with the selected tag"""
-        if not hasattr(self, 'notes_model') or not hasattr(self, 'notes_tree_model'):
+                    if applications:
+                        menu.addMenu(open_with_menu)
+                        
+                    menu.addSeparator()
+                    
+                    # Add compare if multiple files are selected
+                    if hasattr(self, 'compare_files_action'):
+                        compare_with_menu = QMenu("Compare With...", menu)
+                        compare_with_menu.addAction(self.create_action(
+                            "Select File...", lambda: self.compare_with_file(first_item_path)
+                        ))
+                        menu.addMenu(compare_with_menu)
+
+    def sync_directory(self, directory_path):
+        """Synchronize a directory with another location"""
+        if not directory_path or not os.path.isdir(directory_path):
+            self.show_error("Please select a valid directory to synchronize.")
             return
+            
+        # Check if sync_manager is available
+        if not hasattr(self, 'sync_manager'):
+            from ..tools.sync_manager import DirectorySyncManager
+            self.sync_manager = DirectorySyncManager(self)
+            
+        # Get notes vault path as the initial target suggestion
+        target_dir = ""
+        if hasattr(self, 'notes_manager'):
+            notes_path = self.notes_manager.get_notes_vault_path()
+            if notes_path and os.path.exists(notes_path) and os.path.normpath(notes_path) != os.path.normpath(directory_path):
+                target_dir = notes_path
         
-        # Get the selected tag
-        tag_model = self.notes_tags_list.model()
-        tag_item = tag_model.itemFromIndex(index)
-        selected_tag = tag_item.data(Qt.ItemDataRole.UserRole)
-        
-        # Store the current filter for reference
-        self.current_tag_filter = selected_tag
-        
-        # Show status message
-        if selected_tag == "all":
-            self.status_bar.showMessage("Showing all notes", 3000)
-        else:
-            count = 0
-            if selected_tag in self.notes_model.tags_map:
-                count = len(self.notes_model.tags_map[selected_tag])
-            self.status_bar.showMessage(f"Filtering notes by tag: {selected_tag} ({count} notes)", 3000)
-        
-        # Apply filter to the tree model
-        if hasattr(self.notes_tree_model, 'setFilterTag'):
-            self.notes_tree_model.setFilterTag(selected_tag)
-        
-        # Apply filter to the list model if in list view
-        if hasattr(self.notes_model, 'setFilterTag'):
-            self.notes_model.setFilterTag(selected_tag)
-        
-        # Refresh the view to show the filtered notes
-        self.tree_view.expandAll()
-        self.tree_view.viewport().update()
-        self.list_view.viewport().update()
+        # Open the sync dialog
+        self.sync_manager.show_sync_dialog(directory_path, target_dir)
 
     def setup_drives(self):
         """Set up the drives section"""
@@ -1135,12 +919,11 @@ class EExplorer(QMainWindow):
             self.tree_view.setRootIndex(index)
             self.list_view.setRootIndex(index)
             
-            # Update address bar
-            if hasattr(self, 'address_bar'):
-                self.address_bar.setText(self.model.filePath(index))
+            # Update address bar (safely)
+            path = self.model.filePath(index)
+            self.update_address_bar(path)
             
             # Add path to file watcher if not already watching
-            path = self.model.filePath(index)
             if hasattr(self, 'file_watcher') and path not in self.file_watcher.directories():
                 self.file_watcher.addPath(path)
         
@@ -1149,7 +932,305 @@ class EExplorer(QMainWindow):
             self.current_view = self.tree_view
         else:
             self.current_view = self.list_view
+            
+    def update_address_bar(self, path):
+        """Update the address bar with the given path, recreating it if necessary"""
+        try:
+            if hasattr(self, 'address_bar') and self.address_bar is not None:
+                self.address_bar.setText(path)
+            else:
+                # Address bar missing, recreate it
+                self.recreate_address_bar()
+                if hasattr(self, 'address_bar') and self.address_bar is not None:
+                    self.address_bar.setText(path)
+                else:
+                    print("Failed to recreate address bar")
+        except RuntimeError:
+            # Address bar has been deleted, recreate it
+            print("Address bar C++ object no longer exists, recreating")
+            self.recreate_address_bar()
+            # Try again with the new address bar
+            if hasattr(self, 'address_bar') and self.address_bar is not None:
+                try:
+                    self.address_bar.setText(path)
+                except Exception as e:
+                    print(f"Error setting path in recreated address bar: {e}")
+        except Exception as e:
+            print(f"Error updating address bar: {e}")
 
+    def recreate_address_bar(self):
+        """Recreate the address bar if it has been deleted"""
+        try:
+            # Check if address bar needs recreation
+            if not hasattr(self, 'address_bar') or self.address_bar is None:
+                print("Recreating address bar")
+                
+                # Find the nav_bar
+                if hasattr(self, 'nav_bar') and self.nav_bar is not None:
+                    # Clear any existing layout contents
+                    if self.nav_bar.layout():
+                        while self.nav_bar.layout().count():
+                            item = self.nav_bar.layout().takeAt(0)
+                            if item.widget():
+                                item.widget().deleteLater()
+                    
+                    # Create a new layout if needed
+                    if not self.nav_bar.layout():
+                        new_layout = QHBoxLayout(self.nav_bar)
+                        new_layout.setContentsMargins(2, 2, 2, 2)
+                        new_layout.setSpacing(4)
+                    
+                    # Recreate navigation buttons
+                    back_btn = QPushButton()
+                    back_btn.setIcon(QIcon.fromTheme("go-previous"))
+                    back_btn.setToolTip("Back")
+                    back_btn.clicked.connect(self.navigate_back)
+                    back_btn.setFixedSize(32, 32)
+                    back_btn.setStyleSheet("QPushButton { border: none; border-radius: 4px; } QPushButton:hover { background-color: rgba(255, 255, 255, 0.1); }")
+                    self.nav_bar.layout().addWidget(back_btn)
+                    
+                    forward_btn = QPushButton()
+                    forward_btn.setIcon(QIcon.fromTheme("go-next"))
+                    forward_btn.setToolTip("Forward")
+                    forward_btn.clicked.connect(self.navigate_forward)
+                    forward_btn.setFixedSize(32, 32)
+                    forward_btn.setStyleSheet("QPushButton { border: none; border-radius: 4px; } QPushButton:hover { background-color: rgba(255, 255, 255, 0.1); }")
+                    self.nav_bar.layout().addWidget(forward_btn)
+                    
+                    up_btn = QPushButton()
+                    up_btn.setIcon(QIcon.fromTheme("go-up"))
+                    up_btn.setToolTip("Up")
+                    up_btn.clicked.connect(self.navigate_up)
+                    up_btn.setFixedSize(32, 32)
+                    up_btn.setStyleSheet("QPushButton { border: none; border-radius: 4px; } QPushButton:hover { background-color: rgba(255, 255, 255, 0.1); }")
+                    self.nav_bar.layout().addWidget(up_btn)
+                    
+                    refresh_btn = QPushButton()
+                    refresh_btn.setIcon(QIcon.fromTheme("view-refresh"))
+                    refresh_btn.setToolTip("Refresh")
+                    refresh_btn.clicked.connect(self.refresh_view)
+                    refresh_btn.setFixedSize(32, 32)
+                    refresh_btn.setStyleSheet("QPushButton { border: none; border-radius: 4px; } QPushButton:hover { background-color: rgba(255, 255, 255, 0.1); }")
+                    self.nav_bar.layout().addWidget(refresh_btn)
+                    
+                    # Create a new address bar
+                    try:
+                        from .address_bar import AddressBar
+                        self.address_bar = AddressBar()
+                    except (ImportError, ModuleNotFoundError):
+                        # Fallback to plain QLineEdit
+                        self.address_bar = QLineEdit()
+                        
+                    # Configure the address bar
+                    self.address_bar.returnPressed.connect(self.handle_address_bar)
+                    self.address_bar.setMinimumWidth(300)
+                    self.nav_bar.layout().addWidget(self.address_bar, 1)
+                    
+                    # Set initial path
+                    current_path = self.get_current_path() or os.path.expanduser("~")
+                    self.address_bar.setText(current_path)
+                    
+                    print("Address bar recreated in nav_bar")
+                    return True
+                else:
+                    # No nav_bar, create one
+                    print("No nav_bar found, creating a new one")
+                    self.nav_bar = self.setup_navigation()
+                    
+                    # If we have a main layout, add it at the top
+                    central_widget = self.centralWidget()
+                    if central_widget and central_widget.layout():
+                        central_widget.layout().insertWidget(0, self.nav_bar)
+                        print("Added new nav_bar to main layout")
+                        return True
+                    
+                    print("Could not add nav_bar to layout")
+                    return False
+            return True  # Address bar already exists
+        except Exception as e:
+            print(f"Error recreating address bar: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def navigate_to_path(self, path):
+        """Navigate to a specific path"""
+        if not path or not os.path.exists(path):
+            print(f"Cannot navigate to nonexistent path: {path}")
+            return
+            
+        # Special case for notes mode
+        if self.current_mode == 'notes':
+            # In notes mode, allow navigating to the notes vault path
+            notes_vault_path = ""
+            if hasattr(self, 'notes_manager'):
+                notes_vault_path = self.notes_manager.get_notes_vault_path()
+                
+            if path == notes_vault_path:
+                # This is valid - update address bar to show notes vault path
+                self.update_address_bar(path)
+                
+                # If notes tree model exists, ensure it's set on the tree view
+                if hasattr(self, 'notes_tree_model') and self.notes_tree_model:
+                    self.tree_view.setModel(self.notes_tree_model)
+                    self.tree_view.expandToDepth(0)  # Show top-level items
+                    
+                print(f"Set address bar to notes vault path: {path}")
+                return
+            else:
+                print(f"Cannot navigate to {path} in notes mode")
+                return
+        
+        # Update address bar with the target path
+        self.update_address_bar(path)
+            
+        # Get the model index for the path
+        index = self.model.index(path)
+        if index.isValid():
+            try:
+                self.navigate_to(index)
+            except RuntimeError as e:
+                print(f"RuntimeError in navigate_to_path: {e}")
+                # Try again after recreating address bar
+                if "has been deleted" in str(e):
+                    self.recreate_address_bar()
+                    try:
+                        self.navigate_to(index)
+                    except Exception as e2:
+                        print(f"Failed to navigate after recreating address bar: {e2}")
+            except Exception as e:
+                print(f"Error in navigate_to_path: {e}")
+        else:
+            print(f"Invalid index for path: {path}")
+
+    def setup_navigation(self):
+        """Set up navigation bar with buttons and address bar"""
+        # If we already have a navigation bar from the setup_ui method, use that
+        if hasattr(self, 'nav_bar') and self.nav_bar is not None:
+            return self.nav_bar
+            
+        # Otherwise create a new NavigationBar
+        try:
+            from .navigation import NavigationBar
+            nav_bar = NavigationBar(self)
+            
+            # Connect signals
+            nav_bar.path_changed.connect(self.navigate_to_path)
+            nav_bar.back_requested.connect(self.navigate_back)
+            nav_bar.forward_requested.connect(self.navigate_forward)
+            nav_bar.up_requested.connect(self.navigate_up)
+            nav_bar.refresh_requested.connect(self.refresh_view)
+            
+            # Connect mode change signal if available
+            if hasattr(nav_bar, 'mode_changed'):
+                nav_bar.mode_changed.connect(self.switch_mode)
+                
+            # Set initial path
+            try:
+                current_path = os.path.expanduser("~")  # Default to home
+                if hasattr(self, 'model') and hasattr(self, 'current_view'):
+                    model_path = self.model.filePath(self.current_view.rootIndex())
+                    if model_path and os.path.exists(model_path):
+                        current_path = model_path
+                
+                nav_bar.set_path(current_path)
+            except Exception as e:
+                print(f"Error setting initial path in navigation bar: {e}")
+                
+            # Set initial mode
+            if hasattr(nav_bar, 'set_mode'):
+                nav_bar.set_mode(self.current_mode)
+                
+            return nav_bar
+            
+        except ImportError as e:
+            print(f"Error importing NavigationBar: {e}")
+            # Continue with fallback
+        except Exception as e:
+            print(f"Error creating navigation bar: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        # Create container for navigation controls (fallback)
+        nav_widget = QWidget()
+        nav_layout = QHBoxLayout(nav_widget)
+        nav_layout.setContentsMargins(2, 2, 2, 2)
+        nav_layout.setSpacing(4)
+        
+        # Navigation buttons
+        back_btn = QPushButton()
+        back_btn.setIcon(QIcon.fromTheme("go-previous"))
+        back_btn.setToolTip("Back")
+        back_btn.clicked.connect(self.navigate_back)
+        back_btn.setFixedSize(32, 32)
+        back_btn.setStyleSheet("QPushButton { border: none; border-radius: 4px; } QPushButton:hover { background-color: rgba(255, 255, 255, 0.1); }")
+        nav_layout.addWidget(back_btn)
+        
+        forward_btn = QPushButton()
+        forward_btn.setIcon(QIcon.fromTheme("go-next"))
+        forward_btn.setToolTip("Forward")
+        forward_btn.clicked.connect(self.navigate_forward)
+        forward_btn.setFixedSize(32, 32)
+        forward_btn.setStyleSheet("QPushButton { border: none; border-radius: 4px; } QPushButton:hover { background-color: rgba(255, 255, 255, 0.1); }")
+        nav_layout.addWidget(forward_btn)
+        
+        up_btn = QPushButton()
+        up_btn.setIcon(QIcon.fromTheme("go-up"))
+        up_btn.setToolTip("Up")
+        up_btn.clicked.connect(self.navigate_up)
+        up_btn.setFixedSize(32, 32)
+        up_btn.setStyleSheet("QPushButton { border: none; border-radius: 4px; } QPushButton:hover { background-color: rgba(255, 255, 255, 0.1); }")
+        nav_layout.addWidget(up_btn)
+        
+        refresh_btn = QPushButton()
+        refresh_btn.setIcon(QIcon.fromTheme("view-refresh"))
+        refresh_btn.setToolTip("Refresh")
+        refresh_btn.clicked.connect(self.refresh_view)
+        refresh_btn.setFixedSize(32, 32)
+        refresh_btn.setStyleSheet("QPushButton { border: none; border-radius: 4px; } QPushButton:hover { background-color: rgba(255, 255, 255, 0.1); }")
+        nav_layout.addWidget(refresh_btn)
+        
+        # Address bar
+        try:
+            from .address_bar import AddressBar
+            self.address_bar = AddressBar()
+            self.address_bar.returnPressed.connect(self.handle_address_bar)
+            self.address_bar.setMinimumWidth(300)  # Ensure it has adequate width
+            nav_layout.addWidget(self.address_bar, 1)  # Give address bar stretch factor to fill available space
+        except ImportError as e:
+            print(f"Error importing AddressBar: {e}")
+            # Create a fallback QLineEdit
+            self.address_bar = QLineEdit()
+            self.address_bar.returnPressed.connect(self.handle_address_bar)
+            self.address_bar.setMinimumWidth(300)
+            nav_layout.addWidget(self.address_bar, 1)
+        except Exception as e:
+            print(f"Error creating address bar: {e}")
+            
+        # Try to initialize with current path
+        try:
+            current_path = os.path.expanduser("~")  # Default to home
+            if hasattr(self, 'model') and hasattr(self, 'current_view'):
+                model_path = self.model.filePath(self.current_view.rootIndex())
+                if model_path and os.path.exists(model_path):
+                    current_path = model_path
+            
+            if hasattr(self, 'address_bar') and self.address_bar is not None:
+                self.address_bar.setText(current_path)
+        except Exception as e:
+            print(f"Error setting initial path in address bar: {e}")
+        
+        return nav_widget
+
+    def handle_address_bar(self):
+        """Handle address bar input"""
+        try:
+            path = self.address_bar.text()
+            self.navigate_to_address(path)
+        except Exception as e:
+            print(f"Error handling address bar input: {e}")
+            self.show_error(f"Error navigating to path: {str(e)}")
+            
     def navigate_to_address(self, path):
         """Navigate to a specific path address"""
         if not path or not os.path.exists(path):
@@ -1165,31 +1246,23 @@ class EExplorer(QMainWindow):
         # Handle directory vs file
         if os.path.isdir(path):
             # Navigate to directory
-            index = self.model.index(path)
-            if index.isValid():
-                self.navigate_to(index)
-            else:
-                self.show_error(f"Invalid path index: {path}")
+            self.navigate_to_path(path)
         else:
             # For files, navigate to parent directory and select file
             parent_dir = os.path.dirname(path)
             if os.path.exists(parent_dir):
                 # First navigate to parent directory
-                parent_index = self.model.index(parent_dir)
-                if parent_index.isValid():
-                    self.navigate_to(parent_index)
-                    
-                    # Then select the file
-                    file_index = self.model.index(path)
-                    if file_index.isValid():
-                        self.current_view.setCurrentIndex(file_index)
-                        # Update preview if needed
-                        self.handle_selection_changed()
-                else:
-                    self.show_error(f"Invalid parent directory: {parent_dir}")
+                self.navigate_to_path(parent_dir)
+                
+                # Then select the file
+                file_index = self.model.index(path)
+                if file_index.isValid():
+                    self.current_view.setCurrentIndex(file_index)
+                    # Update preview if needed
+                    self.handle_selection_changed()
             else:
                 self.show_error(f"Parent directory not found: {parent_dir}")
-
+                
     def get_current_path(self):
         """Get the current path in the file tree"""
         if self.current_mode == 'notes':
@@ -1199,66 +1272,7 @@ class EExplorer(QMainWindow):
         elif hasattr(self, 'model') and hasattr(self, 'current_view'):
             return self.model.filePath(self.current_view.rootIndex())
         return ""
-        
-    def navigate_to_path(self, path):
-        """Navigate to a specific path"""
-        if not path or not os.path.exists(path):
-            print(f"Cannot navigate to nonexistent path: {path}")
-            return
-            
-        if self.current_mode == 'notes':
-            print("Cannot navigate to arbitrary paths in notes mode")
-            return
-            
-        index = self.model.index(path)
-        if index.isValid():
-            self.navigate_to(index)
 
-    def setup_navigation(self):
-        """Set up navigation bar with buttons and address bar"""
-        # Create container for navigation controls
-        nav_widget = QWidget()
-        nav_layout = QHBoxLayout(nav_widget)
-        nav_layout.setContentsMargins(0, 0, 0, 0)
-        nav_layout.setSpacing(4)
-        
-        # Navigation buttons
-        back_btn = QPushButton()
-        back_btn.setIcon(QIcon.fromTheme("go-previous"))
-        back_btn.setToolTip("Back")
-        back_btn.clicked.connect(self.navigate_back)
-        nav_layout.addWidget(back_btn)
-        
-        forward_btn = QPushButton()
-        forward_btn.setIcon(QIcon.fromTheme("go-next"))
-        forward_btn.setToolTip("Forward")
-        forward_btn.clicked.connect(self.navigate_forward)
-        nav_layout.addWidget(forward_btn)
-        
-        up_btn = QPushButton()
-        up_btn.setIcon(QIcon.fromTheme("go-up"))
-        up_btn.setToolTip("Up")
-        up_btn.clicked.connect(self.navigate_up)
-        nav_layout.addWidget(up_btn)
-        
-        refresh_btn = QPushButton()
-        refresh_btn.setIcon(QIcon.fromTheme("view-refresh"))
-        refresh_btn.setToolTip("Refresh")
-        refresh_btn.clicked.connect(self.refresh_view)
-        nav_layout.addWidget(refresh_btn)
-        
-        # Address bar
-        self.address_bar = AddressBar()
-        self.address_bar.returnPressed.connect(self.handle_address_bar)
-        nav_layout.addWidget(self.address_bar)
-        
-        return nav_widget
-
-    def handle_address_bar(self):
-        """Handle address bar input"""
-        path = self.address_bar.text()
-        self.navigate_to_address(path)
-        
     def navigate_back(self):
         """Navigate back in history"""
         if self.nav_current > 0:
@@ -1293,12 +1307,50 @@ class EExplorer(QMainWindow):
         if self.current_mode == 'notes':
             print("DEBUG: In notes mode, can't navigate up from vault root")
             return
+        
+        # Make sure the address bar is available
+        self.check_address_bar()
             
         current_path = self.get_current_path()
         parent_path = os.path.dirname(current_path)
         
         if parent_path and parent_path != current_path:
-            self.navigate_to_path(parent_path)
+            try:
+                self.navigate_to_path(parent_path)
+            except RuntimeError as e:
+                if "AddressBar has been deleted" in str(e):
+                    # Address bar was deleted, try to recreate it
+                    self.recreate_address_bar()
+                    
+                    # Try again
+                    try:
+                        self.navigate_to_path(parent_path)
+                    except Exception as e2:
+                        print(f"Failed to navigate up after recreating address bar: {e2}")
+                else:
+                    print(f"RuntimeError in navigate_up: {e}")
+            except Exception as e:
+                print(f"Error in navigate_up: {e}")
+
+    def check_address_bar(self):
+        """Check if address bar exists and try to recreate it if not"""
+        if not hasattr(self, 'address_bar') or self.address_bar is None:
+            print("Address bar missing, attempting to recreate")
+            self.recreate_address_bar()
+            return hasattr(self, 'address_bar') and self.address_bar is not None
+        
+        # Try to verify the address bar is still valid
+        try:
+            # A simple property access should raise an exception if the object is deleted
+            test = self.address_bar.isVisible()
+            return True
+        except RuntimeError:
+            print("Address bar C++ object deleted, attempting to recreate")
+            self.recreate_address_bar()
+            return hasattr(self, 'address_bar') and self.address_bar is not None
+        except Exception as e:
+            print(f"Error checking address bar: {e}")
+            return False
 
     def refresh_view(self, directory=None):
         """Refresh the current view"""
@@ -1373,82 +1425,40 @@ class EExplorer(QMainWindow):
                     pass
 
     def toggle_toolbar_visibility(self, file_visible=True, project_visible=False, notes_visible=False):
-        """Toggle visibility of toolbar buttons based on mode"""
-        # File mode toolbar buttons
-        file_buttons = [
-            'back_button', 'forward_button', 'up_button', 'refresh_button',
-            'new_folder_button', 'copy_button', 'cut_button', 'paste_button',
-            'delete_button', 'rename_button'
-        ]
-        
-        # Project mode toolbar buttons
-        project_buttons = [
-            'build_button', 'run_button', 'debug_button', 'test_button',
-            'vcs_button', 'terminal_button', 'smelt_button', 'cast_button', 
-            'forge_button', 'contract_button', 'doc_button'
-        ]
-        
-        # Notes mode toolbar buttons
-        notes_buttons = [
-            'tag_button', 'find_dupes_button', 'sort_button', 'search_notes_button',
-            'create_note_button', 'back_button', 'forward_button', 'refresh_button'
-        ]
-        
-        # Toggle button visibility based on the current mode
-        if notes_visible:
-            # In notes mode, only show notes buttons
-            for btn_name in notes_buttons:
-                if hasattr(self, btn_name):
-                    button = getattr(self, btn_name)
-                    button.setVisible(True)
-            
-            # Hide all project and file-specific buttons
-            for btn_name in file_buttons:
-                if hasattr(self, btn_name) and btn_name not in notes_buttons:
-                    button = getattr(self, btn_name)
-                    button.setVisible(False)
-            
-            for btn_name in project_buttons:
-                if hasattr(self, btn_name):
-                    button = getattr(self, btn_name)
-                    button.setVisible(False)
-        else:
-            # In file or project mode
-            for btn_name in file_buttons:
-                if hasattr(self, btn_name):
-                    button = getattr(self, btn_name)
-                    button.setVisible(file_visible)
-            
-            for btn_name in project_buttons:
-                if hasattr(self, btn_name):
-                    button = getattr(self, btn_name)
-                    button.setVisible(project_visible)
-            
-            # Always hide notes buttons in non-notes modes
-            for btn_name in notes_buttons:
-                if hasattr(self, btn_name) and btn_name not in file_buttons:
-                    button = getattr(self, btn_name)
-                    button.setVisible(False)
-            
-        # Make sure address bar is visible in file and project mode only
-        try:
-            if hasattr(self, 'address_bar'):
-                self.address_bar.setVisible((file_visible or project_visible) and not notes_visible)
-        except RuntimeError:
-            # The C++ object might have been deleted
-            print("Warning: Address bar widget was deleted")
-            pass
+        """Toggle toolbar visibility based on the current mode"""
+        # Enable/disable actions and sections based on mode
+        if hasattr(self, 'file_actions'):
+            for action in self.file_actions:
+                action.setVisible(file_visible)
+                
+        if hasattr(self, 'project_actions'):
+            for action in self.project_actions:
+                action.setVisible(project_visible)
+                
+        if hasattr(self, 'notes_actions'):
+            for action in self.notes_actions:
+                action.setVisible(notes_visible)
+                
+        # Update toolbar to hide empty sections
+        if hasattr(self, 'toolbar'):
+            for action in self.toolbar.actions():
+                action_text = action.text()
+                
+                # Toggle section visibility based on mode
+                if action_text in ["File Operations", "Navigation"]:
+                    action.setVisible(file_visible)
+                elif action_text in ["Project"]:
+                    action.setVisible(project_visible)
+                elif action_text in ["Notes"]:
+                    action.setVisible(notes_visible)
 
     def setup_project_mode(self):
-        """Set up project mode"""
+        """Initialize project mode (e.g., set up version control, build system)"""
         try:
-            # Get the current working directory as the project root
-            project_path = os.getcwd()
-            
-            # Check if it's a valid directory
-            if not os.path.isdir(project_path):
-                self.show_error("Invalid project path")
-                return
+            # Get project root (use current directory by default)
+            project_path = self.get_current_path()
+            if not project_path or not os.path.isdir(project_path):
+                project_path = os.getcwd()
             
             # Configure file model to use project root
             self.tree_view.setModel(self.model)
@@ -1470,22 +1480,74 @@ class EExplorer(QMainWindow):
                     print("Warning: Address bar was deleted, creating new one")
                     # Don't try to recreate it here to avoid potential new issues
                     pass
+            
+                # Try to detect project type
+                project_type = self.detect_project_type(project_path)
+                
+                if project_type:
+                    # Update project indicator
+                    if hasattr(self, 'project_type'):
+                        self.project_type.setText(f"{project_type}")
                     
+                    # Set project in build manager
+                    if hasattr(self, 'build_manager'):
+                        if hasattr(self.build_manager, 'set_project'):
+                            self.build_manager.set_project(project_path, project_type)
+                        else:
+                            print("build_manager doesn't have set_project method")
+                    
+                    # Update status bar
+                    self.statusBar().showMessage(f"Project: {os.path.basename(project_path)} ({project_type})", 3000)
+                    
+                    # Update title
+                    self.setWindowTitle(f"EEPY Explorer - {os.path.basename(project_path)} ({project_type})")
+                else:
+                    # No specific project type detected
+                    if hasattr(self, 'project_type'):
+                        self.project_type.setText("Generic Project")
+                        
+                    # Update status bar
+                    self.statusBar().showMessage(f"Project: {os.path.basename(project_path)}", 3000)
+                    
+                    # Update title
+                    self.setWindowTitle(f"EEPY Explorer - {os.path.basename(project_path)}")
+                
                 # Update project configuration - pass self (the explorer instance)
-                set_project_root(self)
+                try:
+                    # Try different import paths since we don't know the exact structure
+                    try:
+                        from ..tools.project import set_project_root
+                    except ImportError:
+                        try:
+                            from src.tools.project import set_project_root
+                        except ImportError:
+                            try:
+                                from tools.project import set_project_root
+                            except ImportError:
+                                print("Could not import set_project_root from any module path")
+                                raise
+                    
+                    # Call function if import succeeded
+                    set_project_root(self)
+                except (ImportError, AttributeError) as e:
+                    print(f"Couldn't use set_project_root: {e}")
+                except Exception as e:
+                    print(f"Error in set_project_root: {e}")
                 
                 # Show test panel if available
                 if hasattr(self, 'test_view'):
                     self.test_view.show()
-                    
-                # Update status bar
-                self.status_bar.showMessage(f"Project: {os.path.basename(project_path)}", 3000)
+                
+                return project_type
             else:
-                self.show_error(f"Could not set project root: {project_path}")
+                self.statusBar().showMessage(f"Could not set project root: {project_path}", 3000)
+                return None
         except Exception as e:
-            self.show_error(f"Error setting up project mode: {str(e)}")
+            print(f"Error setting up project mode: {str(e)}")
             import traceback
             traceback.print_exc()
+            self.statusBar().showMessage(f"Error setting up project mode: {str(e)}", 3000)
+            return None
 
     def open_in_internal_editor(self, path):
         """Open a file in the internal editor"""
@@ -1808,11 +1870,7 @@ class EExplorer(QMainWindow):
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(4)
         
-        # Add navigation bar
-        nav_widget = self.setup_navigation()
-        container_layout.addWidget(nav_widget)
-        
-        # Create view container
+        # Create view container (without adding navigation bar again)
         self.view_stack = QStackedWidget()
         
         # Configure tree view
@@ -1907,3 +1965,714 @@ class EExplorer(QMainWindow):
                 
         # Handle other common key events
         super().keyPressEvent(event)
+
+    def create_menu(self):
+        """Create main menu"""
+        # Create the menu bar
+        menu_bar = self.menuBar()
+        
+        # File menu
+        file_menu = menu_bar.addMenu("&File")
+        file_menu.addAction("&New File", self.new_file, "Ctrl+N")
+        file_menu.addAction("&Open File", self.open_file, "Ctrl+O")
+        file_menu.addAction("&Save", lambda: self.editor_tabs.save_current_file() if hasattr(self, 'editor_tabs') else None, "Ctrl+S")
+        file_menu.addAction("Save &As", lambda: self.editor_tabs.save_current_file_as() if hasattr(self, 'editor_tabs') else None, "Ctrl+Shift+S")
+        file_menu.addSeparator()
+        file_menu.addAction("&Refresh", lambda: self.refresh_view(), "F5")
+        file_menu.addSeparator()
+        file_menu.addAction("E&xit", self.close, "Alt+F4")
+        
+        # Edit menu
+        edit_menu = menu_bar.addMenu("&Edit")
+        edit_menu.addAction("&Cut", lambda: self.file_ops.cut_selected_files(), "Ctrl+X")
+        edit_menu.addAction("&Copy", lambda: self.file_ops.copy_selected_files(), "Ctrl+C")
+        edit_menu.addAction("&Paste", lambda: self.file_ops.paste_files(), "Ctrl+V")
+        edit_menu.addSeparator()
+        edit_menu.addAction("&Find Files", self.show_find_dialog, "Ctrl+F")
+        
+        # View menu
+        view_menu = menu_bar.addMenu("&View")
+        view_menu.addAction("File &Browser Mode", self.set_file_mode, "Ctrl+1")
+        view_menu.addAction("&Project Mode", self.set_project_mode, "Ctrl+2")
+        view_menu.addAction("&Notes Mode", self.set_notes_mode, "Ctrl+3")
+        view_menu.addSeparator()
+        view_menu.addAction("List View", lambda: self.set_view_mode('list'), "Ctrl+L")
+        view_menu.addAction("Icon View", lambda: self.set_view_mode('icon'), "Ctrl+I")
+        view_menu.addSeparator()
+        view_menu.addAction("Toggle &Preview", self.toggle_preview, "F12")
+        
+        # Tools menu
+        tools_menu = menu_bar.addMenu("&Tools")
+        tools_menu.addAction("&Terminal", lambda: self.open_in_terminal(self.get_current_path()), "F9")
+        tools_menu.addAction("&Open Shell", self.open_shell)
+        
+        # Project menu
+        project_menu = menu_bar.addMenu("&Project")
+        project_menu.addAction("&Run Project", lambda: self.show_launch_manager(self.get_current_path()), "F5")
+        project_menu.addAction("&Build Project", lambda: self.build_manager.build_project(self.get_current_path()), "F7")
+        project_menu.addAction("&Test Project", lambda: self.test_tool.run_tests(self.get_current_path()), "F8")
+        
+        # Notes menu
+        notes_menu = menu_bar.addMenu("&Notes")
+        notes_menu.addAction("&Sort Notes", self.sort_notes)
+        notes_menu.addAction("&Search Content", self.search_notes_content)
+        notes_menu.addAction("&Manage Tags", self.manage_tags)
+        notes_menu.addAction("&New Note", self.create_new_note)
+        notes_menu.addAction("Find &Duplicates", self.find_duplicate_notes)
+        
+        # Add Sync submenu to Notes menu
+        sync_menu = notes_menu.addMenu("&Synchronize")
+        sync_menu.addAction("&Sync Directories", self.synchronize_directories)
+        sync_menu.addAction("&Open Sync Manager", self.open_sync_manager)
+        sync_menu.addAction("&Schedule Sync", self.open_sync_scheduler)
+        
+        return menu_bar
+
+    def synchronize_directories(self):
+        """Open the synchronize directories dialog"""
+        try:
+            # Ensure sync_manager is initialized
+            if not hasattr(self, 'sync_manager'):
+                from ..tools.sync_manager import DirectorySyncManager
+                self.sync_manager = DirectorySyncManager(self)
+                
+            self.sync_manager.show_sync_dialog()
+        except ImportError as e:
+            print(f"Error importing sync dialog: {e}")
+            QMessageBox.critical(self, "Error", "Sync dialog module not available")
+    
+    def open_sync_manager(self):
+        """Open the sync manager dialog"""
+        try:
+            # Same as synchronize_directories for now, but could be extended with more features
+            self.synchronize_directories()
+        except Exception as e:
+            print(f"Error opening sync manager: {e}")
+            QMessageBox.critical(self, "Error", f"Error opening sync manager: {str(e)}")
+    
+    def open_sync_scheduler(self):
+        """Open the sync scheduler dialog"""
+        try:
+            # Ensure sync_manager is initialized
+            if not hasattr(self, 'sync_manager'):
+                from ..tools.sync_manager import DirectorySyncManager
+                self.sync_manager = DirectorySyncManager(self)
+                
+            self.sync_manager.show_schedule_dialog()
+        except ImportError as e:
+            print(f"Error importing sync scheduler: {e}")
+            QMessageBox.critical(self, "Error", "Sync scheduler module not available")
+    
+    def find_duplicate_notes(self):
+        """Find and manage duplicate notes"""
+        try:
+            # Use the more feature-rich notes duplicate dialog
+            from ..widgets.notes_duplicate_dialog import NotesDuplicateDialog
+            
+            dialog = NotesDuplicateDialog(self)
+            notes_path = self.get_notes_dir()
+            if notes_path:
+                dialog.scan_directory(notes_path)
+                dialog.exec()
+            else:
+                QMessageBox.critical(self, "Error", "No notes directory configured.")
+                
+        except Exception as e:
+            print(f"Error finding duplicate notes: {e}")
+            QMessageBox.critical(self, "Error", f"Error finding duplicate notes: {str(e)}")
+
+    def delete_files(self):
+        """Delete selected files and directories with confirmation."""
+        # Get selected paths based on current view
+        selected_paths = []
+        
+        # Get selected indexes from the current view
+        if self.current_mode == 'file' or self.current_mode == 'project':
+            indexes = self.current_view.selectedIndexes()
+            # Filter to just get unique file paths (one per row)
+            for index in indexes:
+                if index.column() == 0:  # Only consider the first column
+                    path = self.model.filePath(index)
+                    if path and path not in selected_paths:
+                        selected_paths.append(path)
+        elif self.current_mode == 'notes':
+            # Handle notes selection
+            if hasattr(self, 'notes_tree_model') and self.tree_view.selectionModel():
+                indexes = self.tree_view.selectionModel().selectedIndexes()
+                for index in indexes:
+                    if index.column() == 0:  # Only consider the first column
+                        data = self.notes_tree_model.data(index, Qt.ItemDataRole.UserRole)
+                        if isinstance(data, dict):
+                            path = data.get('path', '')
+                        elif isinstance(data, str):
+                            path = data
+                        else:
+                            continue
+                            
+                        if path:
+                            # Convert to absolute path if needed
+                            if not os.path.isabs(path) and hasattr(self, 'notes_manager'):
+                                notes_path = self.notes_manager.get_notes_vault_path()
+                                path = os.path.join(notes_path, path)
+                                
+                            if path not in selected_paths:
+                                selected_paths.append(path)
+        
+        if not selected_paths:
+            return
+            
+        # Ask for confirmation
+        count = len(selected_paths)
+        if count == 1:
+            msg = f"Are you sure you want to delete '{os.path.basename(selected_paths[0])}'?"
+        else:
+            msg = f"Are you sure you want to delete {count} items?"
+            
+        reply = QMessageBox.question(
+            self, 'Confirm Deletion', 
+            msg, 
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            for path in selected_paths:
+                try:
+                    if os.path.isdir(path):
+                        import shutil
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to delete {path}: {str(e)}")
+            
+            # Refresh the view after deletion
+            self.refresh_view()
+
+    def toggle_view_mode(self):
+        """Toggle between list view and icon view modes"""
+        if self.view_stack.currentWidget() == self.tree_view:
+            # Currently in list/tree view, switch to icon view
+            self.view_stack.setCurrentWidget(self.list_view)
+            self.current_view = self.list_view
+            self.current_view_mode = 'icon'
+        else:
+            # Currently in icon view, switch to list/tree view
+            self.view_stack.setCurrentWidget(self.tree_view)
+            self.current_view = self.tree_view
+            self.current_view_mode = 'list'
+        
+        # Update user interface to reflect the change
+        if hasattr(self, 'status_bar'):
+            self.status_bar.showMessage(f"Switched to {self.current_view_mode} view", 2000)
+
+    def switch_mode(self, mode):
+        """Switch between different application modes (file, project, notes)
+        
+        Args:
+            mode: String indicating the mode ('file', 'project', or 'notes')
+        """
+        try:
+            # Update mode buttons if they exist
+            if hasattr(self, 'file_mode_btn'):
+                self.file_mode_btn.setChecked(mode == 'file')
+            if hasattr(self, 'project_mode_btn'):
+                self.project_mode_btn.setChecked(mode == 'project')
+            if hasattr(self, 'notes_mode_btn'):
+                self.notes_mode_btn.setChecked(mode == 'notes')
+            
+            # Skip if already in the requested mode
+            if self.current_mode == mode:
+                return
+                
+            # Store current mode
+            previous_mode = self.current_mode
+            self.current_mode = mode
+            
+            # Update navigation bar mode if it exists
+            if hasattr(self, 'nav_bar') and hasattr(self.nav_bar, 'set_mode'):
+                try:
+                    self.nav_bar.set_mode(mode)
+                except Exception as e:
+                    print(f"Error updating navigation bar mode: {e}")
+            
+            # Update address bar based on mode
+            self.update_address_bar_for_mode(mode)
+            
+            # Show/hide UI elements based on mode - fixed to prevent project tools hiding
+            if mode == 'file':
+                # VISIBILITY: Show file operations, hide project and notes operations
+                self._set_toolbar_visibility(show_file=True, show_project=False, show_notes=False)
+                
+                # Switch from notes back to standard file model if needed
+                if previous_mode == 'notes' and hasattr(self, 'notes_tree_model'):
+                    self.tree_view.setModel(self.model)
+                    self.list_view.setModel(self.model)
+                    
+                    # Navigate to home directory or last file path
+                    home_path = os.path.expanduser("~")
+                    try:
+                        self.navigate_to_path(home_path)
+                    except Exception as e:
+                        print(f"Error navigating to home: {str(e)}")
+                
+                # Update status bar
+                self.statusBar().showMessage("File Explorer Mode", 2000)
+                
+            elif mode == 'project':
+                # VISIBILITY: Show file and project operations, hide notes operations
+                self._set_toolbar_visibility(show_file=True, show_project=True, show_notes=False)
+                    
+                # Switch to project mode
+                self.setup_project_mode()
+                
+            elif mode == 'notes':
+                # VISIBILITY: Show file and notes operations, hide project operations
+                self._set_toolbar_visibility(show_file=True, show_project=False, show_notes=True)
+                    
+                # Switch to notes mode
+                if not hasattr(self, 'notes_manager'):
+                    # Initialize notes manager if needed
+                    try:
+                        from ..tools.notes_manager import NotesManager
+                    except ImportError:
+                        try:
+                            from src.tools.notes_manager import NotesManager
+                        except ImportError:
+                            try:
+                                from tools.notes_manager import NotesManager
+                            except ImportError:
+                                print("Error importing NotesManager module")
+                                self.statusBar().showMessage("Notes mode not available - missing NotesManager", 3000)
+                                # Reset mode
+                                self.current_mode = previous_mode
+                                return
+                
+                    # Create notes manager
+                    self.notes_manager = NotesManager(self)
+                    print("Created new NotesManager")
+                
+                # Set up notes mode
+                self.notes_tree_model = self.notes_manager.setup_notes_mode(self)
+                
+                # Connect notes loaded signal if needed
+                if not hasattr(self.notes_manager, 'notes_loaded') or \
+                   not hasattr(self.notes_manager.notes_loaded, 'isConnected') or \
+                   not self.notes_manager.notes_loaded.isConnected(self.on_notes_loaded):
+                    self.notes_manager.notes_loaded.connect(self.on_notes_loaded)
+                
+                # If the model is already available, make sure it's properly displayed
+                if hasattr(self, 'notes_tree_model') and self.notes_tree_model:
+                    # Set the model on the tree view
+                    self.tree_view.setModel(self.notes_tree_model)
+                    # Explicitly expand top-level items
+                    self.tree_view.expandToDepth(0)
+                    # Force switch to tree view
+                    self.view_stack.setCurrentWidget(self.tree_view)
+                    self.current_view = self.tree_view
+                    
+                    # Get notes vault path
+                    notes_vault_path = self.notes_manager.get_notes_vault_path()
+                    
+                    # Update address bar with notes vault path
+                    if hasattr(self, 'address_bar') and notes_vault_path and os.path.exists(notes_vault_path):
+                        self.address_bar.setText(notes_vault_path)
+                        print(f"Set address bar to notes vault path: {notes_vault_path}")
+                
+                # Update status bar
+                self.statusBar().showMessage("Notes Vault Mode", 2000)
+            else:
+                self.statusBar().showMessage("Unknown mode", 2000)
+                # Reset mode
+                self.current_mode = previous_mode
+        except Exception as e:
+            print(f"Error switching mode: {e}")
+            import traceback
+            traceback.print_exc()
+            self.statusBar().showMessage(f"Error switching to {mode} mode: {str(e)}", 3000)
+            
+    def _set_toolbar_visibility(self, show_file=True, show_project=False, show_notes=False):
+        """Helper method to set toolbar visibility consistently"""
+        try:
+            # File operation buttons
+            if hasattr(self, 'copy_button'):
+                self.copy_button.setVisible(show_file)
+            if hasattr(self, 'cut_button'):
+                self.cut_button.setVisible(show_file)
+            if hasattr(self, 'paste_button'):
+                self.paste_button.setVisible(show_file)
+            
+            # Project operation buttons
+            if hasattr(self, 'vcs_button'):
+                self.vcs_button.setVisible(show_project)
+            if hasattr(self, 'build_button'):
+                self.build_button.setVisible(show_project)
+            if hasattr(self, 'smelt_button'):
+                self.smelt_button.setVisible(show_project)
+            if hasattr(self, 'cast_button'):
+                self.cast_button.setVisible(show_project)
+            if hasattr(self, 'forge_button'):
+                self.forge_button.setVisible(show_project)
+            
+            # Notes operation buttons
+            if hasattr(self, 'tag_button'):
+                self.tag_button.setVisible(show_notes)
+            if hasattr(self, 'find_dupes_button'):
+                self.find_dupes_button.setVisible(show_notes)
+            if hasattr(self, 'sort_button'):
+                self.sort_button.setVisible(show_notes)
+            if hasattr(self, 'search_notes_button'):
+                self.search_notes_button.setVisible(show_notes)
+            if hasattr(self, 'create_note_button'):
+                self.create_note_button.setVisible(show_notes)
+        except Exception as e:
+            print(f"Error setting toolbar visibility: {e}")
+
+    def switch_view_mode(self, mode):
+        """Switch to a specific view mode (list or grid)
+        
+        Args:
+            mode: String indicating the mode ('list' or 'grid')
+        """
+        if mode == 'list':
+            self.view_stack.setCurrentWidget(self.tree_view)
+            self.current_view = self.tree_view
+            self.current_view_mode = 'list'
+            
+            # Update toggle button states if they exist
+            if hasattr(self, 'list_view_btn'):
+                self.list_view_btn.setChecked(True)
+            if hasattr(self, 'grid_view_btn'):
+                self.grid_view_btn.setChecked(False)
+                
+        elif mode == 'grid' or mode == 'icon':
+            self.view_stack.setCurrentWidget(self.list_view)
+            self.current_view = self.list_view
+            self.current_view_mode = 'icon'
+            
+            # Update toggle button states if they exist
+            if hasattr(self, 'list_view_btn'):
+                self.list_view_btn.setChecked(False)
+            if hasattr(self, 'grid_view_btn'):
+                self.grid_view_btn.setChecked(True)
+                
+        # Update status bar
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage(f"Switched to {self.current_view_mode} view", 2000)
+
+    def on_notes_loaded(self, notes_tree_model):
+        """Handle notes being loaded by the notes manager"""
+        try:
+            # Check if the model is valid
+            if not notes_tree_model:
+                print("Error: Notes tree model is None")
+                return
+                
+            print("Setting up notes view with loaded model")
+            
+            # Update tree view with notes model
+            self.tree_view.setModel(notes_tree_model)
+            
+            # Add sorting capability
+            self.tree_view.setSortingEnabled(True)
+            self.tree_view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+            
+            # Expand the root item to show contents
+            self.tree_view.expandToDepth(0)  # Show top-level items
+            
+            # Store reference to the model
+            self.notes_tree_model = notes_tree_model
+            
+            # Hide the grid view button and show list view only
+            if hasattr(self, 'grid_view_btn'):
+                self.grid_view_btn.setEnabled(False)
+            if hasattr(self, 'list_view_btn'):
+                self.list_view_btn.setChecked(True)
+                self.list_view_btn.setEnabled(False)
+            
+            # Set view mode to list
+            self.view_stack.setCurrentWidget(self.tree_view)
+            self.current_view = self.tree_view
+            self.current_view_mode = 'list'
+            
+            # Connect double-click handler for opening notes
+            if hasattr(self.tree_view, 'doubleClicked'):
+                try:
+                    # Disconnect existing handlers if any
+                    self.tree_view.doubleClicked.disconnect()
+                except:
+                    pass  # No handlers connected
+                    
+                # Connect to notes handler if available
+                if hasattr(self.notes_manager, 'open_note'):
+                    self.tree_view.doubleClicked.connect(self.notes_manager.open_note)
+            
+            # Custom mouse handling for tag editing
+            if hasattr(self.tree_view, 'mousePressEvent'):
+                # Store original handler if not already stored
+                if not hasattr(self, '_original_mouse_press'):
+                    self._original_mouse_press = self.tree_view.mousePressEvent
+                
+                # Set custom handler
+                self.tree_view.mousePressEvent = self.handle_notes_mouse_press
+            
+            # Close any progress dialog
+            if hasattr(self, 'progress_dialog') and self.progress_dialog:
+                self.progress_dialog.close()
+                
+            # Update status bar
+            self.statusBar().showMessage("Notes vault loaded", 2000)
+            
+        except Exception as e:
+            print(f"Error setting up notes view: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Show error in status bar
+            self.statusBar().showMessage(f"Error loading notes: {str(e)}", 5000)
+
+    def set_project_mode(self):
+        """Set the explorer to project mode"""
+        # Get current path as project root
+        project_path = self.get_current_path()
+        
+        # If no path is selected, use current working directory
+        if not project_path or not os.path.isdir(project_path):
+            project_path = os.getcwd()
+            
+        # Switch to project mode
+        self.switch_mode('project')
+        
+        # Set the project root
+        project_index = self.model.index(project_path)
+        if project_index.isValid():
+            self.navigate_to(project_index)
+            
+        # Update project configuration
+        set_project_root(self)
+        
+    def set_file_mode(self):
+        """Set the explorer to file mode"""
+        self.switch_mode('file')
+        
+    def set_notes_mode(self):
+        """Set the explorer to notes mode"""
+        # Initialize notes manager if needed
+        if not hasattr(self, 'notes_manager'):
+            try:
+                from ..tools.notes_manager import NotesManager
+            except ImportError:
+                try:
+                    from src.tools.notes_manager import NotesManager
+                except ImportError:
+                    try:
+                        from tools.notes_manager import NotesManager
+                    except ImportError:
+                        print("Could not import NotesManager")
+                        return
+            
+            self.notes_manager = NotesManager(self)
+            print("Created notes manager")
+        
+        # Switch to notes mode
+        self.switch_mode('notes')
+        
+        # Make sure address bar is updated
+        self.update_address_bar_for_mode('notes')
+
+    def detect_project_type(self, project_path):
+        """Detect the type of project based on files in the project directory
+        
+        Args:
+            project_path: Path to the project directory
+            
+        Returns:
+            String indicating project type (e.g., "Python", "Node.js", etc.) or None if not detected
+        """
+        if not os.path.isdir(project_path):
+            return None
+            
+        # Check for various project types based on their characteristic files
+        if os.path.exists(os.path.join(project_path, "pyproject.toml")):
+            return "Python (pyproject.toml)"
+        elif os.path.exists(os.path.join(project_path, "setup.py")):
+            return "Python (setup.py)"
+        elif os.path.exists(os.path.join(project_path, "requirements.txt")):
+            return "Python"
+        elif os.path.exists(os.path.join(project_path, "Cargo.toml")):
+            return "Rust"
+        elif os.path.exists(os.path.join(project_path, "build.zig")):
+            return "Zig"
+        elif os.path.exists(os.path.join(project_path, "package.json")):
+            return "Node.js"
+        elif os.path.exists(os.path.join(project_path, "CMakeLists.txt")):
+            return "CMake"
+        elif os.path.exists(os.path.join(project_path, "Makefile")) or any(f.endswith(".mk") for f in os.listdir(project_path)):
+            return "Make"
+        elif os.path.exists(os.path.join(project_path, "pom.xml")):
+            return "Java (Maven)"
+        elif os.path.exists(os.path.join(project_path, "build.gradle")):
+            return "Java (Gradle)"
+        elif os.path.exists(os.path.join(project_path, ".git")):
+            return "Git Repository"
+            
+        # Default case - generic directory
+        return None
+
+    def update_address_bar_for_mode(self, mode):
+        """Update the address bar based on current mode"""
+        try:
+            if mode == 'notes':
+                # For notes mode, set to notes vault path
+                if hasattr(self, 'notes_manager') and hasattr(self.notes_manager, 'get_notes_vault_path'):
+                    notes_path = self.notes_manager.get_notes_vault_path()
+                    if notes_path:
+                        print(f"Notes path from manager: {notes_path}")
+                        # Force navigate to notes path
+                        if os.path.exists(notes_path):
+                            # Directly update address bar
+                            if hasattr(self, 'address_bar'):
+                                self.address_bar.setText(notes_path)
+                                print(f"Updated address bar to notes path: {notes_path}")
+                            
+                            # If notes tree model exists, make sure it's set
+                            if hasattr(self, 'notes_tree_model') and self.notes_tree_model:
+                                self.tree_view.setModel(self.notes_tree_model)
+                                self.tree_view.expandToDepth(0)
+                                print("Set tree view model to notes model")
+                            else:
+                                print("Notes tree model not available yet")
+                        else:
+                            print(f"Notes path doesn't exist: {notes_path}")
+                    else:
+                        print("No notes path available from notes manager")
+                else:
+                    print("Notes manager not properly initialized")
+                        
+            elif mode == 'project':
+                # For project mode, set to current project root
+                project_path = self.get_current_path()
+                if project_path and os.path.exists(project_path) and os.path.isdir(project_path):
+                    # Update address bar
+                    if hasattr(self, 'address_bar'):
+                        self.address_bar.setText(project_path)
+                        print(f"Updated address bar to project path: {project_path}")
+                    
+                    # Navigate to the project path
+                    self.tree_view.setModel(self.model)
+                    index = self.model.index(project_path)
+                    if index.isValid():
+                        try:
+                            self.tree_view.setRootIndex(index)
+                            self.list_view.setRootIndex(index)
+                        except Exception as e:
+                            print(f"Error setting root index: {e}")
+                else:
+                    print(f"Invalid project path: {project_path}")
+                    
+            elif mode == 'file':
+                # For file mode, get the current path
+                current_path = self.get_current_path()
+                if current_path and os.path.exists(current_path) and os.path.isdir(current_path):
+                    # Update address bar
+                    if hasattr(self, 'address_bar'):
+                        self.address_bar.setText(current_path)
+                        print(f"Updated address bar to file path: {current_path}")
+                else:
+                    home_path = os.path.expanduser("~")
+                    if hasattr(self, 'address_bar'):
+                        self.address_bar.setText(home_path)
+                        print(f"Updated address bar to home path: {home_path}")
+                
+                    # Navigate to the home directory
+                    index = self.model.index(home_path)
+                    if index.isValid():
+                        try:
+                            self.tree_view.setRootIndex(index)
+                            self.list_view.setRootIndex(index)
+                        except Exception as e:
+                            print(f"Error setting root index: {e}")
+                
+        except Exception as e:
+            print(f"Error updating address bar for mode {mode}: {e}")
+            import traceback
+            traceback.print_exc()
+
+def get_synchronized_directory_pair(parent=None):
+    """Get a pair of directories to synchronize"""
+    from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+                               QPushButton, QComboBox, QDialogButtonBox, QFileDialog)
+    from PyQt6.QtCore import Qt
+    
+    # Create a dialog to select directories and sync mode
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Directory Pair")
+    dialog.setMinimumWidth(500)
+    
+    layout = QVBoxLayout(dialog)
+    
+    # Source directory
+    source_layout = QHBoxLayout()
+    source_layout.addWidget(QLabel("Source:"))
+    source_edit = QLabel()
+    source_edit.setFrameStyle(QLabel.Shape.Panel | QLabel.Shadow.Sunken)
+    source_layout.addWidget(source_edit, 1)
+    source_btn = QPushButton("Browse...")
+    
+    def browse_source():
+        directory = QFileDialog.getExistingDirectory(
+            dialog, "Select Source Directory", source_edit.text(),
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks
+        )
+        if directory:
+            source_edit.setText(directory)
+            
+    source_btn.clicked.connect(browse_source)
+    source_layout.addWidget(source_btn)
+    layout.addLayout(source_layout)
+    
+    # Target directory
+    target_layout = QHBoxLayout()
+    target_layout.addWidget(QLabel("Target:"))
+    target_edit = QLabel()
+    target_edit.setFrameStyle(QLabel.Shape.Panel | QLabel.Shadow.Sunken)
+    target_layout.addWidget(target_edit, 1)
+    target_btn = QPushButton("Browse...")
+    
+    def browse_target():
+        directory = QFileDialog.getExistingDirectory(
+            dialog, "Select Target Directory", target_edit.text(),
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks
+        )
+        if directory:
+            target_edit.setText(directory)
+            
+    target_btn.clicked.connect(browse_target)
+    target_layout.addWidget(target_btn)
+    layout.addLayout(target_layout)
+    
+    # Sync mode
+    mode_layout = QHBoxLayout()
+    mode_layout.addWidget(QLabel("Sync Mode:"))
+    mode_combo = QComboBox()
+    mode_combo.addItem("Two-way sync", "two_way")
+    mode_combo.addItem("Mirror source to target", "mirror")
+    mode_combo.addItem("One-way (source to target)", "one_way_source_to_target")
+    mode_combo.addItem("One-way (target to source)", "one_way_target_to_source")
+    mode_layout.addWidget(mode_combo, 1)
+    layout.addLayout(mode_layout)
+    
+    # Buttons
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | 
+        QDialogButtonBox.StandardButton.Cancel
+    )
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+    
+    # Execute dialog
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        return source_edit.text(), target_edit.text(), mode_combo.currentData()
+    else:
+        return None, None, None
